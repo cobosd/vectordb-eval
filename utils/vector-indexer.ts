@@ -10,6 +10,7 @@ import type { CollectionKey } from "../consts";
 import { TurbopufferStore } from "../services/turbopuffer/store";
 import { PineconeStore } from "../services/pinecone/store";
 import { QdrantStore } from "../services/qdrant/store";
+import { OpenSearchStore } from "../services/opensearch/store";
 import { createLogger } from "../logger";
 import type { ServiceName, VectorRow, VectorStore } from "./vector-store";
 
@@ -23,6 +24,7 @@ const STORE_FACTORIES: Record<ServiceName, (collection: CollectionKey) => Vector
   turbopuffer: (collection) => new TurbopufferStore(collection),
   pinecone: (collection) => new PineconeStore(collection),
   qdrant: (collection) => new QdrantStore(collection),
+  opensearch: (collection) => new OpenSearchStore(collection),
 };
 
 export const ALL_SERVICES = Object.keys(STORE_FACTORIES) as ServiceName[];

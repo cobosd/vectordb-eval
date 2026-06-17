@@ -25,6 +25,8 @@ export type CollectionConfig = {
   pineconeIndex: string;
   /** Qdrant collection name. */
   qdrantCollection: string;
+  /** OpenSearch index name (lowercase, no leading _ or -). */
+  opensearchIndex: string;
 };
 
 export const COLLECTIONS: Record<CollectionKey, CollectionConfig> = {
@@ -34,6 +36,7 @@ export const COLLECTIONS: Record<CollectionKey, CollectionConfig> = {
     turbopufferNamespace: "bill_text",
     pineconeIndex: "bill-text",
     qdrantCollection: "bill_text",
+    opensearchIndex: "bill_text",
   },
   bill_amendment: {
     key: "bill_amendment",
@@ -41,6 +44,7 @@ export const COLLECTIONS: Record<CollectionKey, CollectionConfig> = {
     turbopufferNamespace: "bill_amendment",
     pineconeIndex: "bill-amendment",
     qdrantCollection: "bill_amendment",
+    opensearchIndex: "bill_amendment",
   },
 };
 

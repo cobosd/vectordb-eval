@@ -7,7 +7,7 @@
  */
 
 /** Identifier for a vector-db backend. Add new ones here as they're implemented. */
-export type ServiceName = "turbopuffer" | "pinecone" | "qdrant";
+export type ServiceName = "turbopuffer" | "pinecone" | "qdrant" | "opensearch";
 
 /** Metadata value types accepted by both Turbopuffer and Pinecone. */
 export type MetadataValue = string | number | boolean | string[];
