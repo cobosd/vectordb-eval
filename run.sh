@@ -3,14 +3,30 @@
 # Run the latency benchmarks (unfiltered + filtered) across a matrix of
 # (topK, iterations) combinations, against all services.
 #
-#   ./run.sh                      # all services, default consistency (strong), no prewarm
+#   ./run.sh                            # all services, strong consistency, no prewarm
+#   ./run.sh --consistency=eventual     # eventual consistency (Turbopuffer only honors it)
+#   ./run.sh --warm                     # enable native cache prewarm
 #   SERVICES=turbopuffer,pinecone ./run.sh
-#   ./run.sh --warm --consistency=eventual   # extra flags are passed through to both scripts
+#   CONSISTENCY=eventual ./run.sh       # env-var form, equivalent to the flag
+#
+# --consistency is parsed here and threaded into both scripts; any other flags
+# (e.g. --warm, --topk overrides) pass straight through.
 #
 set -euo pipefail
 cd "$(dirname "$0")"
 
 SERVICES="${SERVICES:-turbopuffer,pinecone,qdrant,opensearch}"
+CONSISTENCY="${CONSISTENCY:-strong}"
+
+# Pull --consistency=… out of the args (so it isn't also passed twice); everything
+# else is forwarded to both benchmark scripts.
+PASS_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --consistency=*) CONSISTENCY="${arg#--consistency=}" ;;
+    *) PASS_ARGS+=("$arg") ;;
+  esac
+done
 
 # (topK iterations) pairs to sweep.
 COMBOS=(
@@ -26,12 +42,14 @@ for combo in "${COMBOS[@]}"; do
   read -r topk iters <<<"$combo"
   echo
   echo "============================================================"
-  echo "  topK=$topk  iterations=$iters  services=$SERVICES"
+  echo "  topK=$topk  iterations=$iters  consistency=$CONSISTENCY  services=$SERVICES"
   echo "============================================================"
 
   echo "--- unfiltered (scripts/performance.ts) ---"
-  bun scripts/performance.ts --services="$SERVICES" --topk="$topk" --iterations="$iters" "$@"
+  bun scripts/performance.ts --services="$SERVICES" --topk="$topk" --iterations="$iters" \
+    --consistency="$CONSISTENCY" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
 
   echo "--- filtered (scripts/performance-filtered.ts) ---"
-  bun scripts/performance-filtered.ts --services="$SERVICES" --topk="$topk" --iterations="$iters" "$@"
+  bun scripts/performance-filtered.ts --services="$SERVICES" --topk="$topk" --iterations="$iters" \
+    --consistency="$CONSISTENCY" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
 done

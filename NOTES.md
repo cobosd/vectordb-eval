@@ -6,6 +6,45 @@ not just docs.
 
 ---
 
+## ⚠️ Disclaimer: read the latency numbers carefully
+
+The benchmark results (`evals/*.md`, `scripts/performance*.ts`) are **not a clean
+engine-vs-engine comparison**. The services are in **different deployment classes**, and
+that — not the search engine — drives most of the latency differences. Treat the numbers as
+"how fast is *this service in this configuration* from *this client*," not "which engine is
+fastest."
+
+Specific things that skew the comparison:
+
+- **Network proximity dominates at this scale.** Our dataset is small (~41k vectors), so
+  queries are mostly network + per-request overhead, not ANN compute. Whoever is closest on
+  the wire wins. From the in-region EC2:
+  - **OpenSearch** is a private endpoint in the **same VPC and AZ** → shortest path (~sub-ms
+    RTT), so it looks fastest.
+  - **Turbopuffer / Pinecone / Qdrant Cloud** are reached over **public** (in-region) endpoints
+    → more hops, even though traffic stays on the AWS backbone.
+  - From a **laptop**, all of the public ones add a ~35–40ms internet hop that has nothing to
+    do with the engine.
+- **Dedicated vs multi-tenant.** Our OpenSearch domain is a dedicated single node serving only
+  this workload; the managed services are multi-tenant (noisy-neighbor variance, extra routing
+  layers — visible in their worse tail latencies, e.g. Pinecone max spikes into the hundreds–
+  thousands of ms).
+- **Consistency setting isn't symmetric.** The benchmarks default to `--consistency=strong`,
+  which only Turbopuffer honors (an object-storage round-trip per query); Pinecone/Qdrant/
+  OpenSearch are effectively eventual. So Turbopuffer is handicapped unless you pass
+  `--consistency=eventual`.
+- **Prewarm is off by default** (`--warm` to enable), so first-query cold-cache effects (esp.
+  Qdrant Cloud's ~50ms cold-segment plateau) inflate averages.
+- **Small, in-RAM dataset.** Engine/index differences (HNSW tuning, filtering strategy) barely
+  show until production scale (millions of vectors), where ANN compute starts to dominate.
+
+**For a fair engine comparison:** put everything in the same deployment class (all in-VPC — TP/
+Pinecone BYOC, self-hosted Qdrant/OpenSearch), compare **server-reported** compute time
+(OpenSearch `took`, Turbopuffer `server_total_ms`) to cancel the network term, and test at
+realistic scale. See [docs/EC2-BENCHMARK.md](docs/EC2-BENCHMARK.md).
+
+---
+
 ## Turbopuffer
 
 ### Deployment
