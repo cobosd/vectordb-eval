@@ -71,6 +71,24 @@ async function timeIt<T>(fn: () => Promise<T>): Promise<[T, number]> {
   return [result, performance.now() - start];
 }
 
+// Surface a hanging call (e.g. a stuck OpenSearch connection) instead of stalling forever.
+const QUERY_TIMEOUT_MS = 20_000;
+function withTimeout<T>(label: string, promise: Promise<T>, ms = QUERY_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
 function stats(samples: number[]) {
   const sorted = [...samples].sort((a, b) => a - b);
   const pct = (p: number) => sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))]!;
@@ -106,15 +124,28 @@ async function oneShot(): Promise<void> {
     const stores = Object.fromEntries(
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
-    if (WARM) await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
+    if (WARM) {
+      logger.info("Warming", { service });
+      await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch((e) => logger.warn("warm failed", { service, collection: c, error: String(e) }))));
+    }
 
     for (const collection of COLLECTION_KEYS) {
-      const [hits, ms] = await timeIt(() => stores[collection].query(vector, { topK: TOPK, consistency: CONSISTENCY }));
-      rows[`${service}:${collection}`] = {
-        "latency(ms)": round(ms),
-        hits: hits.length,
-        "top score": Math.round((hits[0]?.score ?? 0) * 1000) / 1000,
-      };
+      const label = `${service}:${collection}`;
+      logger.info("Querying", { label });
+      try {
+        const [hits, ms] = await timeIt(() =>
+          withTimeout(label, stores[collection].query(vector, { topK: TOPK, consistency: CONSISTENCY })),
+        );
+        logger.info("Query done", { label, ms: round(ms), hits: hits.length });
+        rows[label] = {
+          "latency(ms)": round(ms),
+          hits: hits.length,
+          "top score": Math.round((hits[0]?.score ?? 0) * 1000) / 1000,
+        };
+      } catch (error) {
+        logger.error("Query failed", { label, error: error instanceof Error ? error.message : String(error) });
+        rows[label] = { "latency(ms)": -1, hits: -1, "top score": -1 };
+      }
     }
   }
 
