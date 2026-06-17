@@ -1,0 +1,23 @@
+{
+  "name": "vectordb-eval",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "prisma": "^6.6.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@opensearch-project/opensearch": "^3.6.0",
+    "@pinecone-database/pinecone": "^7.2.0",
+    "@prisma/client": "^6.6.0",
+    "@qdrant/js-client-rest": "^1.18.0",
+    "@turbopuffer/turbopuffer": "^2.5.0",
+    "openai": "^6.42.0",
+    "tiktoken": "^1.0.22",
+    "winston": "^3.19.0"
+  }
+}

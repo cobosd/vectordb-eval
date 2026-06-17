@@ -1,0 +1,203 @@
+/**
+ * Filtered variant of scripts/performance.ts: same latency comparison, but every
+ * query carries a metadata pre-filter on session_id (eq for one session, `in` for
+ * several) and notification_action_time_epoch (numeric range — a lower bound, and
+ * optionally an upper bound for a bounded `since <= date <= until` window). Both
+ * filters are numeric, so Turbopuffer and Pinecone run the identical filter for a
+ * fair comparison.
+ *
+ * Requires the epoch field to exist — it's written natively by the ingester
+ * (buildBillMetadata), so any normal ingest produces it.
+ *
+ *   bun scripts/performance-filtered.ts
+ *   bun scripts/performance-filtered.ts --session=2163 --since=2026-06-10 --topk=20 --iterations=50
+ *   # multiple sessions (session_id IN [...]) + a bounded date window (since <= date <= until):
+ *   bun scripts/performance-filtered.ts --sessions=2176,2244,2189 --since=2026-05-15 --until=2026-06-10
+ */
+
+import { COLLECTION_KEYS, type CollectionKey } from "../consts";
+import { embedBatch } from "../utils/embedder";
+import { createStore } from "../utils/vector-indexer";
+import { toEpoch } from "../utils/bill-metadata";
+import type { QueryFilter, ServiceName, VectorStore } from "../utils/vector-store";
+import { createLogger } from "../logger";
+
+const logger = createLogger("performance-filtered");
+
+const DEFAULT_QUERIES = [
+  "What bills address renewable energy and solar power incentives?",
+  "Regulations on firearm purchases and background checks",
+  "Funding for public education and teacher salaries",
+  "Healthcare access and Medicaid expansion",
+  "Criminal justice reform and sentencing guidelines",
+];
+
+const args = process.argv.slice(2);
+const flag = (name: string, fallback: string): string => {
+  const found = args.find((a) => a.startsWith(`--${name}=`));
+  return found ? found.slice(name.length + 3) : fallback;
+};
+
+const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "session", "sessions", "since", "until"]);
+const unknown = args
+  .filter((a) => a.startsWith("--"))
+  .map((a) => a.slice(2).split("=")[0]!)
+  .filter((name) => !KNOWN_FLAGS.has(name));
+if (unknown.length) {
+  console.error(`Unknown flag(s): ${unknown.map((u) => `--${u}`).join(", ")}. Known: ${[...KNOWN_FLAGS].map((k) => `--${k}`).join(", ")}`);
+  process.exit(1);
+}
+
+const QUERIES = args.filter((a) => !a.startsWith("--"));
+const queries = QUERIES.length ? QUERIES : DEFAULT_QUERIES;
+const TOPK = Number(flag("topk", "20"));
+const ITERATIONS = Number(flag("iterations", "50"));
+const SERVICES = flag("services", "turbopuffer,pinecone").split(",").filter(Boolean) as ServiceName[];
+const CONSISTENCY = flag("consistency", "eventual") as "strong" | "eventual";
+
+// --sessions=2176,2244 (preferred) or --session=2176 (single, back-compat).
+const SESSIONS = flag("sessions", flag("session", "2163"))
+  .split(",")
+  .map((s) => Number(s.trim()))
+  .filter((n) => Number.isFinite(n));
+if (SESSIONS.length === 0) {
+  console.error(`No valid session ids in --sessions (got "${flag("sessions", flag("session", ""))}").`);
+  process.exit(1);
+}
+
+const SINCE = flag("since", "2026-06-10");
+const UNTIL = flag("until", ""); // optional upper bound; empty = open-ended (since-only)
+
+const SINCE_EPOCH = toEpoch(SINCE);
+if (SINCE_EPOCH === 0) {
+  console.error(`Invalid --since date: "${SINCE}" (expected an ISO date like 2026-06-10).`);
+  process.exit(1);
+}
+const UNTIL_EPOCH = UNTIL ? toEpoch(UNTIL) : 0;
+if (UNTIL && UNTIL_EPOCH === 0) {
+  console.error(`Invalid --until date: "${UNTIL}" (expected an ISO date like 2026-06-10).`);
+  process.exit(1);
+}
+if (UNTIL_EPOCH && UNTIL_EPOCH <= SINCE_EPOCH) {
+  console.error(`--until (${UNTIL}) must be after --since (${SINCE}).`);
+  process.exit(1);
+}
+
+// Numeric filter both backends run identically: session_id eq/in + an epoch range
+// (lower bound always, upper bound when --until is given → bounded date window).
+const FILTER: QueryFilter = [
+  SESSIONS.length === 1
+    ? { field: "session_id", op: "eq", value: SESSIONS[0]! }
+    : { field: "session_id", op: "in", value: SESSIONS },
+  { field: "notification_action_time_epoch", op: "gte", value: SINCE_EPOCH },
+  ...(UNTIL_EPOCH
+    ? [{ field: "notification_action_time_epoch", op: "lte", value: UNTIL_EPOCH } satisfies QueryFilter[number]]
+    : []),
+];
+
+const round = (n: number) => Math.round(n * 10) / 10;
+
+async function timeIt<T>(fn: () => Promise<T>): Promise<[T, number]> {
+  const start = performance.now();
+  const result = await fn();
+  return [result, performance.now() - start];
+}
+
+function stats(samples: number[]) {
+  const sorted = [...samples].sort((a, b) => a - b);
+  const pct = (p: number) => sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))]!;
+  const sum = sorted.reduce((a, b) => a + b, 0);
+  return {
+    calls: sorted.length,
+    "min(ms)": round(sorted[0] ?? 0),
+    "avg(ms)": round(sum / (sorted.length || 1)),
+    "p50(ms)": round(pct(50)),
+    "p95(ms)": round(pct(95)),
+    "max(ms)": round(sorted[sorted.length - 1] ?? 0),
+  };
+}
+
+async function main() {
+  logger.info("Embedding queries", {
+    queries: queries.length,
+    services: SERVICES,
+    topK: TOPK,
+    consistency: CONSISTENCY,
+    filter: { sessions: SESSIONS, since: SINCE, until: UNTIL || undefined },
+  });
+  const [vectors, embedMs] = await timeIt(() => embedBatch(queries));
+  const sessionClause =
+    SESSIONS.length === 1 ? `session_id == ${SESSIONS[0]}` : `session_id IN [${SESSIONS.join(", ")}]`;
+  const dateClause = UNTIL_EPOCH
+    ? `${SINCE_EPOCH} (${SINCE}) <= notification_action_time_epoch <= ${UNTIL_EPOCH} (${UNTIL})`
+    : `notification_action_time_epoch >= ${SINCE_EPOCH} (${SINCE})`;
+  console.log(
+    `\nEmbedded ${queries.length} queries in ${round(embedMs)}ms. ` +
+      `Filter: ${sessionClause} AND ${dateClause}\n`,
+  );
+
+  const perCall: Record<string, number[]> = {};
+  const endToEnd: Record<string, number[]> = {};
+  const endToEndMax: Record<string, number[]> = {};
+  const hitCounts: Record<string, number> = {};
+
+  const queryOpts = { topK: TOPK, consistency: CONSISTENCY, filter: FILTER };
+
+  for (const service of SERVICES) {
+    const stores = Object.fromEntries(
+      COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
+    ) as Record<CollectionKey, VectorStore>;
+
+    await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
+    await Promise.all(
+      COLLECTION_KEYS.map((c) =>
+        stores[c]
+          .query(vectors[0]!, queryOpts)
+          .then((hits) => (hitCounts[`${service}:${c}`] = hits.length))
+          .catch(() => []),
+      ),
+    );
+
+    for (let iter = 0; iter < ITERATIONS; iter++) {
+      for (const vector of vectors) {
+        for (const collection of COLLECTION_KEYS) {
+          const [, ms] = await timeIt(() => stores[collection].query(vector, queryOpts));
+          (perCall[`${service}:${collection}`] ??= []).push(ms);
+        }
+        const components: number[] = [];
+        const [, combined] = await timeIt(() =>
+          Promise.all(
+            COLLECTION_KEYS.map(async (collection) => {
+              const [, ms] = await timeIt(() => stores[collection].query(vector, queryOpts));
+              components.push(ms);
+            }),
+          ),
+        );
+        (endToEnd[service] ??= []).push(combined);
+        (endToEndMax[service] ??= []).push(Math.max(...components));
+      }
+    }
+  }
+
+  console.log("Hits matching the filter (first query, topK):");
+  console.table(hitCounts);
+
+  console.log("\nPer-collection filtered query latency:");
+  console.table(Object.fromEntries(Object.entries(perCall).map(([k, v]) => [k, stats(v)])));
+
+  console.log("\nEnd-to-end filtered search latency (both collections in parallel):");
+  const e2eRows: Record<string, ReturnType<typeof stats>> = {};
+  for (const service of SERVICES) {
+    if (endToEnd[service]) e2eRows[`${service} end-to-end`] = stats(endToEnd[service]!);
+    if (endToEndMax[service]) e2eRows[`${service} max(per-collection)`] = stats(endToEndMax[service]!);
+  }
+  console.table(e2eRows);
+}
+
+main().catch((error) => {
+  logger.error("Filtered performance run failed", {
+    error: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined,
+  });
+  process.exit(1);
+});
