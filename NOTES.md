@@ -54,6 +54,17 @@ realistic scale. See [docs/EC2-BENCHMARK.md](docs/EC2-BENCHMARK.md).
   it remotely via a control plane. Keeps data residency in your network (CMEK, private
   networking), bypasses markup pricing (uses your cloud volume discounts), and — like
   co-locating — removes the public-internet hop. Enterprise: ~$4,096/mo + usage premium.
+- **Matching OpenSearch's in-VPC latency:** BYOC is the way to get Turbopuffer into the same
+  private-networking class as our in-VPC OpenSearch domain — pods run in your VPC (schedule them
+  in the same AZ as the app; cross-AZ is only ~0.5–1ms anyway), so there's no public hop. Caveat:
+  even in-VPC, Turbopuffer is **object-storage-backed (S3) with NVMe/RAM cache tiers**, not a
+  dedicated node holding the whole index in RAM like the OpenSearch domain. So **warm** (cache-hit)
+  queries are comparable, but **cold** queries fetch from regional S3 and are slower — `warm()` /
+  `hintCacheWarm()` matters much more here than for an always-resident OpenSearch node.
+- **PrivateLink (lighter option):** a private endpoint in your VPC routing to *managed* Turbopuffer
+  keeps traffic off the public internet, but compute still lives in Turbopuffer's account/region
+  (cross-account, not co-located) — marginal latency gain over the in-region public endpoint;
+  its value is security/compliance. You **cannot** put managed (non-BYOC) Turbopuffer in your VPC.
 
 ### Capabilities
 - **Native cache prewarm**: `namespace.hintCacheWarm()` warms a namespace deterministically
