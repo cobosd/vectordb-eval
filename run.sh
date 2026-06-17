@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SERVICES="${SERVICES:-turbopuffer,pinecone,qdrant}"
+SERVICES="${SERVICES:-turbopuffer,pinecone,qdrant,opensearch}"
 
 # (topK iterations) pairs to sweep.
 COMBOS=(
