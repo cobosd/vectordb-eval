@@ -38,7 +38,7 @@ const flag = (name: string, fallback: string): string => {
   return found ? found.slice(name.length + 3) : fallback;
 };
 
-const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "session", "sessions", "since", "until"]);
+const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "session", "sessions", "since", "until", "warm"]);
 const unknown = args
   .filter((a) => a.startsWith("--"))
   .map((a) => a.slice(2).split("=")[0]!)
@@ -53,7 +53,9 @@ const queries = QUERIES.length ? QUERIES : DEFAULT_QUERIES;
 const TOPK = Number(flag("topk", "20"));
 const ITERATIONS = Number(flag("iterations", "50"));
 const SERVICES = flag("services", "turbopuffer,pinecone").split(",").filter(Boolean) as ServiceName[];
-const CONSISTENCY = flag("consistency", "eventual") as "strong" | "eventual";
+const CONSISTENCY = flag("consistency", "strong") as "strong" | "eventual";
+// Native cache prewarm (Turbopuffer) is off by default; --warm enables it.
+const WARM = args.includes("--warm");
 
 // --sessions=2176,2244 (preferred) or --session=2176 (single, back-compat).
 const SESSIONS = flag("sessions", flag("session", "2163"))
@@ -148,7 +150,8 @@ async function main() {
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
 
-    await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
+    // Native cache prewarm (Turbopuffer) only when --warm is passed; off by default.
+    if (WARM) await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
     await Promise.all(
       COLLECTION_KEYS.map((c) =>
         stores[c]

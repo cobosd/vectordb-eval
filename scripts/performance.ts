@@ -10,6 +10,8 @@
  *   bun scripts/performance.ts
  *   bun scripts/performance.ts --services=turbopuffer,pinecone --topk=10 --iterations=5
  *   bun scripts/performance.ts "renewable energy incentives" "background check rules"
+ *   bun scripts/performance.ts --query="school funding"   # run one query once per service
+ *   bun scripts/performance.ts --warm                     # opt into native cache prewarm
  */
 
 import { COLLECTION_KEYS, type CollectionKey } from "../consts";
@@ -36,7 +38,7 @@ const flag = (name: string, fallback: string): string => {
 
 // Reject unknown flags so typos / unimplemented options fail loudly instead of
 // being silently ignored.
-const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency"]);
+const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "query", "warm"]);
 const unknown = args
   .filter((a) => a.startsWith("--"))
   .map((a) => a.slice(2).split("=")[0]!)
@@ -56,8 +58,12 @@ const ITERATIONS = Number(flag("iterations", "30"));
 const SERVICES = flag("services", "turbopuffer,pinecone")
   .split(",")
   .filter(Boolean) as ServiceName[];
-// Turbopuffer read consistency (Pinecone serverless ignores it). Default eventual.
-const CONSISTENCY = flag("consistency", "eventual") as "strong" | "eventual";
+// Turbopuffer read consistency (Pinecone serverless ignores it). Default strong.
+const CONSISTENCY = flag("consistency", "strong") as "strong" | "eventual";
+// --query="..." runs that single query once per service (ad-hoc latency probe).
+const ONESHOT = flag("query", "");
+// Native cache prewarm (Turbopuffer hintCacheWarm) is off by default; --warm enables it.
+const WARM = args.includes("--warm");
 
 async function timeIt<T>(fn: () => Promise<T>): Promise<[T, number]> {
   const start = performance.now();
@@ -81,7 +87,44 @@ function stats(samples: number[]) {
 
 const round = (n: number) => Math.round(n * 10) / 10;
 
+/**
+ * One-shot mode (--query="..."): embed the query once, then run it a single time
+ * against each collection of each selected service, reporting that single call's
+ * latency, hit count, and top score. Honors --warm; otherwise the first call pays
+ * connection setup (realistic for a cold ad-hoc query).
+ */
+async function oneShot(): Promise<void> {
+  logger.info("One-shot query", { query: ONESHOT, services: SERVICES, topK: TOPK, consistency: CONSISTENCY, warm: WARM });
+  const [vectors, embedMs] = await timeIt(() => embedBatch([ONESHOT]));
+  const vector = vectors[0]!;
+  console.log(
+    `\nQuery: "${ONESHOT}"  (embed ${round(embedMs)}ms, topK=${TOPK}, consistency=${CONSISTENCY}${WARM ? ", warmed" : ""})\n`,
+  );
+
+  const rows: Record<string, { "latency(ms)": number; hits: number; "top score": number }> = {};
+  for (const service of SERVICES) {
+    const stores = Object.fromEntries(
+      COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
+    ) as Record<CollectionKey, VectorStore>;
+    if (WARM) await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
+
+    for (const collection of COLLECTION_KEYS) {
+      const [hits, ms] = await timeIt(() => stores[collection].query(vector, { topK: TOPK, consistency: CONSISTENCY }));
+      rows[`${service}:${collection}`] = {
+        "latency(ms)": round(ms),
+        hits: hits.length,
+        "top score": Math.round((hits[0]?.score ?? 0) * 1000) / 1000,
+      };
+    }
+  }
+
+  console.log("Single-run query latency:");
+  console.table(rows);
+}
+
 async function main() {
+  if (ONESHOT) return oneShot();
+
   logger.info("Embedding queries", {
     queries: queries.length,
     services: SERVICES,
@@ -108,10 +151,10 @@ async function main() {
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
 
-    // Warm up cold connections + namespace cache (not measured). warm() is native
-    // prewarm where supported (Turbopuffer); the query also primes the HTTP
-    // connection and warms Pinecone (which has no warm endpoint).
-    await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
+    // Native cache prewarm (Turbopuffer) only when --warm is passed; off by default.
+    if (WARM) await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
+    // Always prime the HTTP connection with a throwaway query (not measured) so the
+    // first measured call doesn't pay TLS/connection setup.
     await Promise.all(
       COLLECTION_KEYS.map((c) => stores[c].query(vectors[0]!, { topK: TOPK, consistency: CONSISTENCY }).catch(() => [])),
     );
