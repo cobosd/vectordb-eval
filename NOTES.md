@@ -168,6 +168,59 @@ realistic scale. See [docs/EC2-BENCHMARK.md](docs/EC2-BENCHMARK.md).
 
 ---
 
+## OpenSearch
+
+### Deployment
+- **Open-source (Apache 2.0), so self-hostable like Qdrant** — run the actual engine
+  yourself (Docker / k8s / EC2), or use **AWS OpenSearch Service** (a managed domain). It
+  spans the full range from "your box" to "their box."
+- We run a **managed AWS OpenSearch Service domain placed *inside our VPC*** (private
+  endpoint, `OPENSEARCH_NODE`; basic auth optional via `OPENSEARCH_USERNAME`/`PASSWORD`).
+  Because it sits in the **same VPC/AZ** as the EC2 client, it has the shortest network path
+  of any service here (~sub-ms RTT) — which is why it looks fastest in the eval. The flip
+  side: it is **not reachable from a laptop or from Vercel** — you must be in-VPC
+  (EC2 / bastion / VPN). That's why it's **excluded from the app-triggered (`/run`) analysis**,
+  which only targets the publicly reachable in-region services.
+- Unlike the object-storage-backed engines, our domain is a **dedicated node holding the whole
+  index in RAM / OS page cache** — effectively always warm, so cold-start matters far less.
+
+### Capabilities
+- **`knn_vector` field, HNSW, cosine** (`space_type: cosinesimil`) on the **Lucene engine**
+  specifically (`engine: lucene`, `ef_construction: 128`, `m: 16`) — chosen because Lucene
+  supports **efficient filtering *inside* the k-NN query** (pre-filtered ANN), unlike some of
+  the other engine options.
+- **Filtered k-NN maps cleanly** onto our normalized filter: `eq → term`, `in → terms`,
+  `gt/gte/lt/lte → range`, ANDed in a `bool.filter` passed as the knn query's `filter`.
+  `session_id` + `notification_action_time_epoch` are mapped as `long` so term/range work;
+  other metadata is dynamically mapped.
+- **`date_detection: false`** on the index — bill date strings are inconsistent (empty values
+  appear) and would clash if auto-mapped as `date`; we filter on the numeric epoch instead.
+- **Drops the vector from responses** via `_source.excludes: ["vector"]` — the same
+  payload-trimming win as Turbopuffer/Qdrant (Pinecone can't do this).
+- **Score normalization**: `cosinesimil` reports `(1 + cosine) / 2`; we recover true cosine
+  (`2 * score − 1`) so scores are comparable with the other backends.
+- **Bulk upserts** (batched at 500) with no hard per-request size cap like Pinecone's ~2MB;
+  **reset = drop + recreate** the index (with mapping) rather than delete-by-query.
+
+### Limitations / gotchas
+- **No tunable read consistency** like Turbopuffer's. OpenSearch is near-real-time: a freshly
+  indexed doc isn't searchable until the next **refresh (~1s default)** — effectively eventual.
+  Fine for this static dataset.
+- **No native cache-prewarm endpoint** (no `hintCacheWarm` equivalent). It compensates by being
+  a resident in-RAM node, but watch the **occasional tail outlier** — managed-domain GC /
+  segment-merge noise (we saw one ~1310ms `max` at topK=5/iters=50 against otherwise sub-15ms
+  numbers).
+- **Private-VPC reachability is the operational catch** — excellent latency in-region, but no
+  access from outside the VPC, which is exactly what keeps it out of the hosted dashboard's run
+  path.
+- **Engine choice matters**: filtered k-NN here needs the Lucene engine; the faiss/nmslib
+  engines have historically had filtering constraints. If self-hosting, that's on you to get
+  right.
+- **Self-host = self-operate** (upgrades, scaling, snapshots, monitoring); the AWS-managed
+  domain trades that for instance-hour pricing.
+
+---
+
 ## Deployment cost (rough)
 
 Order-of-magnitude only — BYOC pricing is enterprise/negotiated and changes; verify with sales
@@ -179,12 +232,17 @@ license cost for engineering/ops time (the real cost).
 | **Turbopuffer BYOC** | Enterprise contract | your S3/GCS + K8s compute (your volume discounts, no markup) | vendor patches/manages remotely | **~$4,096/mo** + usage premium *(stated)* |
 | **Pinecone BYOC** | Enterprise tier, custom | your AWS/GCP/Azure region | vendor-managed, zero-access | not publicly listed — negotiated *(est. several $k/mo+)* |
 | **Qdrant self-host** | $0 (Apache 2.0, open source) | just the VM/disk you run it on (e.g. ~$50–500/mo for a single node, scales with data) | **all yours** — upgrades, scaling, backups, monitoring | **$0 software**; cost ≈ infra + engineer time |
+| **OpenSearch (AWS managed)** | $0 (Apache 2.0) — pay for the managed service, not a license | AWS OpenSearch Service instance-hours + EBS (e.g. ~$100–700/mo per node, scales with size) | AWS runs the cluster; you size/patch/snapshot via console | **$0 software**; cost ≈ node-hours + storage |
+| **OpenSearch self-host** | $0 (Apache 2.0) | the VM/disk you run it on | **all yours** | **$0 software**; cost ≈ infra + engineer time |
 
 Notes:
 - Turbopuffer's ~$4,096/mo is the only vendor-published BYOC figure here; Pinecone BYOC is
   quote-only. Both are *on top of* your own cloud bill.
 - Qdrant's headline "free" is real for the software, but budget meaningful eng time for ops —
   that's the line item BYOC is buying away.
+- OpenSearch (and Qdrant) are the open-source options: no license floor, and the AWS-managed
+  OpenSearch domain is the in-VPC analogue of BYOC — your network, AWS-operated — which is what
+  gave it the in-region latency edge in this eval.
 - Managed SaaS (non-BYOC) tiers of Turbopuffer/Pinecone are usage-priced and cheaper to start;
   this table is specifically the in-your-cloud (BYOC) vs own-the-software (self-host) comparison.
 

@@ -1,33 +1,12 @@
 import "server-only";
-import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { parseEvalMarkdown, type EvalDoc } from "./eval-data";
-
-/**
- * The eval markdown lives at the repo root (`evals/`, `NOTES.md`), one level up
- * from this Next app. Walk up from cwd to find it — works whether the build
- * runs from this app directory (Vercel root = src/dashboard) or the repo root.
- */
-function findContentRoot(): string {
-  let dir = process.cwd();
-  for (let i = 0; i < 8; i++) {
-    if (
-      existsSync(path.join(dir, "evals")) &&
-      existsSync(path.join(dir, "NOTES.md"))
-    ) {
-      return dir;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return process.cwd();
-}
+import { repoRoot } from "./paths";
 
 export async function loadEvalDocs(): Promise<EvalDoc[]> {
-  const dir = path.join(findContentRoot(), "evals");
+  const dir = path.join(repoRoot(), "evals");
   let files: string[];
   try {
     files = (await readdir(dir))
@@ -46,7 +25,7 @@ export async function loadEvalDocs(): Promise<EvalDoc[]> {
 
 export async function loadNotes(): Promise<string> {
   try {
-    return await readFile(path.join(findContentRoot(), "NOTES.md"), "utf8");
+    return await readFile(path.join(repoRoot(), "NOTES.md"), "utf8");
   } catch {
     return "# Notes\n\n`NOTES.md` was not found.";
   }

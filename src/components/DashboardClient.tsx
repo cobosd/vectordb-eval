@@ -1,16 +1,18 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
-import { Activity, BookOpen, Database, Gauge, Info } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Activity, Database, Gauge, Info, Trash2 } from "lucide-react";
 
 import type { EvalDoc } from "@/lib/eval-data";
+import { Nav } from "@/components/Nav";
 import { ConsistencyChart } from "@/components/ConsistencyChart";
 import { EvalDataTable } from "@/components/EvalDataTable";
 import { LatencyByServiceChart } from "@/components/LatencyByServiceChart";
 import { Markdown } from "@/components/Markdown";
 import { ScalingChart } from "@/components/ScalingChart";
 import { StatCards } from "@/components/StatCards";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -38,26 +40,64 @@ import {
   type Mode,
 } from "@/lib/eval-helpers";
 
-export function DashboardClient({ docs }: { docs: EvalDoc[] }) {
+export function DashboardClient({
+  docs,
+  active = "dashboard",
+  pickerLabel = "Eval run",
+  deletable = false,
+}: {
+  docs: EvalDoc[];
+  active?: string;
+  pickerLabel?: string;
+  /** Show a per-run delete button (CSV runs only, self-hosted). */
+  deletable?: boolean;
+}) {
+  const router = useRouter();
   const [file, setFile] = React.useState<string>(docs[0]?.file ?? "");
+  const [deleting, setDeleting] = React.useState(false);
   const doc = docs.find((d) => d.file === file) ?? docs[0];
 
+  async function deleteCurrent() {
+    if (!doc) return;
+    if (!window.confirm(`Delete ${doc.file}? This removes evals/csv/${doc.file}.`)) {
+      return;
+    }
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/csv/${encodeURIComponent(doc.file)}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        window.alert(body.error ?? `Delete failed (HTTP ${res.status})`);
+        return;
+      }
+      setFile(""); // fall back to the first remaining run
+      router.refresh(); // re-read evals/csv on the server
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   return (
-    <div className="mx-auto max-w-6xl px-4 py-8">
-      <header className="mb-6 flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Database className="h-4 w-4" />
-            vectordb-eval
-          </div>
-          <h1 className="mt-1 text-2xl font-semibold tracking-tight">
+    <div className="mx-auto max-w-5xl px-4 py-8">
+      <div className="mb-4 flex items-center gap-2 text-sm text-muted-foreground">
+        <Database className="h-4 w-4" />
+        vectordb-eval
+      </div>
+      <header className="mb-6 flex flex-wrap items-end justify-between gap-4">
+        <div className="space-y-3">
+          <Nav active={active} />
+          <h1 className="text-2xl font-semibold tracking-tight">
             {doc?.title ?? "Latency dashboard"}
           </h1>
         </div>
-        <div className="flex items-end gap-3">
-          {docs.length > 0 && (
-            <div className="flex flex-col items-end gap-1">
-              <span className="text-xs text-muted-foreground">Eval run</span>
+        {docs.length > 0 && (
+          <div className="flex flex-col items-end gap-1">
+            <span className="text-xs text-muted-foreground">{pickerLabel}</span>
+            <div className="flex items-center gap-2">
               <Select value={file} onValueChange={setFile}>
                 <SelectTrigger className="w-[260px]">
                   <SelectValue />
@@ -70,16 +110,21 @@ export function DashboardClient({ docs }: { docs: EvalDoc[] }) {
                   ))}
                 </SelectContent>
               </Select>
+              {deletable && doc && (
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={deleteCurrent}
+                  disabled={deleting}
+                  title={`Delete ${doc.file}`}
+                  className="shrink-0 text-muted-foreground hover:text-destructive"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              )}
             </div>
-          )}
-          <Link
-            href="/notes"
-            className="inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground"
-          >
-            <BookOpen className="h-4 w-4" />
-            Service notes
-          </Link>
-        </div>
+          </div>
+        )}
       </header>
 
       {!doc ? (
