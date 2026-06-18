@@ -312,7 +312,7 @@ export function RunClient({ enabled }: { enabled: boolean }) {
         vectordb-eval
       </div>
       <header className="mb-6 space-y-3">
-        <Nav active="run" />
+        <Nav active="run" showRuns={enabled} />
         <h1 className="text-2xl font-semibold tracking-tight">New benchmark run</h1>
       </header>
 

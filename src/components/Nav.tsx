@@ -10,10 +10,16 @@ const LINKS = [
   { href: "/notes", label: "Notes", key: "notes", Icon: FileText },
 ] as const;
 
-export function Nav({ active }: { active?: string }) {
+// The CSV-runs and New-run tabs are only useful where the runner can execute
+// (a host with vector-DB access + a writable FS). They're hidden on read-only
+// deploys like Vercel, where `runsEnabled()` is false.
+const RUN_KEYS = new Set(["csv", "run"]);
+
+export function Nav({ active, showRuns = true }: { active?: string; showRuns?: boolean }) {
+  const links = showRuns ? LINKS : LINKS.filter((l) => !RUN_KEYS.has(l.key));
   return (
     <nav className="flex flex-wrap items-center gap-1">
-      {LINKS.map(({ href, label, key, Icon }) => (
+      {links.map(({ href, label, key, Icon }) => (
         <Link
           key={key}
           href={href}

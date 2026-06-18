@@ -3,6 +3,7 @@ import { Database } from "lucide-react";
 import { Markdown } from "@/components/Markdown";
 import { Nav } from "@/components/Nav";
 import { loadNotes } from "@/lib/load-evals";
+import { runsEnabled } from "@/lib/perf/enabled";
 
 export const dynamic = "force-static";
 
@@ -19,7 +20,7 @@ export default async function NotesPage() {
         vectordb-eval
       </div>
       <header className="mb-6 border-b pb-4">
-        <Nav active="notes" />
+        <Nav active="notes" showRuns={runsEnabled()} />
       </header>
 
       <Markdown className="text-[0.95rem]">{md}</Markdown>

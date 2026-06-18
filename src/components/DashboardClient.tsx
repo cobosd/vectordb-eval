@@ -45,12 +45,15 @@ export function DashboardClient({
   active = "dashboard",
   pickerLabel = "Eval run",
   deletable = false,
+  showRuns = true,
 }: {
   docs: EvalDoc[];
   active?: string;
   pickerLabel?: string;
   /** Show a per-run delete button (CSV runs only, self-hosted). */
   deletable?: boolean;
+  /** Show the CSV-runs / New-run nav tabs (only where the runner can execute). */
+  showRuns?: boolean;
 }) {
   const router = useRouter();
   const [file, setFile] = React.useState<string>(docs[0]?.file ?? "");
@@ -89,7 +92,7 @@ export function DashboardClient({
       </div>
       <header className="mb-6 flex flex-wrap items-end justify-between gap-4">
         <div className="space-y-3">
-          <Nav active={active} />
+          <Nav active={active} showRuns={showRuns} />
           <h1 className="text-2xl font-semibold tracking-tight">
             {doc?.title ?? "Latency dashboard"}
           </h1>

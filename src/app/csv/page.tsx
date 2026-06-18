@@ -15,6 +15,7 @@ export const metadata = {
 
 export default async function CsvPage() {
   const docs = await loadCsvDocs();
+  const enabled = runsEnabled();
 
   if (docs.length === 0) {
     return (
@@ -24,7 +25,7 @@ export default async function CsvPage() {
           vectordb-eval
         </div>
         <div className="mb-8">
-          <Nav active="csv" />
+          <Nav active="csv" showRuns={enabled} />
         </div>
         <div className="rounded-xl border bg-card p-12 text-center">
           <h1 className="text-lg font-semibold">No CSV runs yet</h1>
@@ -45,5 +46,13 @@ export default async function CsvPage() {
     );
   }
 
-  return <DashboardClient docs={docs} active="csv" pickerLabel="CSV run" />;
+  return (
+    <DashboardClient
+      docs={docs}
+      active="csv"
+      pickerLabel="CSV run"
+      deletable={enabled}
+      showRuns={enabled}
+    />
+  );
 }
