@@ -12,6 +12,25 @@ without metadata filtering.
 
 ---
 
+## Dashboard
+
+A Next.js (App Router) dashboard visualizes the eval results. It reads `evals/*.md`
+and `NOTES.md` at **build time** and renders fully static pages — interactive charts +
+a sortable/filterable data table, an eval-run picker, and a `/notes` page.
+
+- Frontend lives under [src/](src/) (`src/app`, `src/components`, `src/lib`); the parser is
+  [src/lib/eval-data.ts](src/lib/eval-data.ts), the build-time loader is
+  [src/lib/load-evals.ts](src/lib/load-evals.ts).
+- Run locally: `bun install && bun dev` → http://localhost:3000
+  (`bun run build` / `bun run start` for the production build).
+- **Deploy to Vercel:** import the repo — Next.js is auto-detected at the root, no Root
+  Directory or extra settings needed. Pages are static, so **adding/editing an eval requires
+  a redeploy** to appear.
+
+> The Bun eval harness (below) and the dashboard share this repo. `next build` only
+> type-checks `src/` (see `tsconfig.json`); the harness keeps its own settings in
+> `tsconfig.harness.json` and runs via Bun.
+
 ## Prerequisites
 
 - [Bun](https://bun.sh) (this repo uses Bun, not Node — `bun <file>`, `bun install`, etc.)
