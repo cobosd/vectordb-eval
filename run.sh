@@ -69,8 +69,12 @@ for consistency in "${CONSISTENCY_LIST[@]}"; do
     bun scripts/performance.ts --services="$SERVICES" --topk="$topk" --iterations="$iters" \
       --consistency="$consistency" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
 
-    echo "--- filtered (scripts/performance-filtered.ts) ---"
-    bun scripts/performance-filtered.ts --services="$SERVICES" --topk="$topk" --iterations="$iters" \
+    echo "--- filtered: session_id only (scripts/performance-filtered.ts) ---"
+    bun scripts/performance-filtered.ts --filter=session --services="$SERVICES" --topk="$topk" --iterations="$iters" \
+      --consistency="$consistency" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
+
+    echo "--- filtered: notification_action_time only (scripts/performance-filtered.ts) ---"
+    bun scripts/performance-filtered.ts --filter=time --services="$SERVICES" --topk="$topk" --iterations="$iters" \
       --consistency="$consistency" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
   done
 done

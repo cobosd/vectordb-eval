@@ -4,7 +4,7 @@
  * its types can be imported (type-only) by the frontend.
  */
 
-export type Mode = "unfiltered" | "filtered";
+export type Mode = "unfiltered" | "filtered" | "filtered-session" | "filtered-time";
 export type Service = "turbopuffer" | "pinecone" | "qdrant" | "opensearch";
 export type Consistency = "eventual" | "strong" | null;
 
