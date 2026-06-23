@@ -488,11 +488,13 @@ async function stageIngest(): Promise<void> {
       if (!(await Bun.file(file).exists())) {
         throw new Error(`Dump file not found: ${file}. Run --stage=dump (or --stage=split) first.`);
       }
-      const buf = buffers.get(collection)!;
       const rl = readZstdLines(file);
       for await (const line of rl) {
         if (!line) continue;
         const rec = JSON.parse(line) as DumpRow;
+        // Re-fetch the buffer each line: flush() swaps in a fresh array, so a hoisted
+        // reference would go stale after the first flush (and silently stop ingesting).
+        const buf = buffers.get(collection)!;
         buf.push({ id: rec.id, vector: decodeVector(rec.v), metadata: rec.metadata });
         if (buf.length >= UPSERT_BATCH_SIZE) await flush(collection);
       }
