@@ -107,7 +107,7 @@ const round = (n: number) => Math.round(n * 10) / 10;
 
 type StatsRow = ReturnType<typeof stats>;
 
-const HIGHLIGHT = "\x1b[102m";
+const HIGHLIGHT = "\x1b[30;102m";
 const RESET = "\x1b[0m";
 
 function color(value: string | number): string {
