@@ -361,11 +361,17 @@ async function stageIngest(): Promise<void> {
     buffers.set(collection, []);
   };
 
+  // Cheap collection detection from the line prefix (collection is always the first
+  // key), so a single-collection ingest skips the other collection's rows WITHOUT a
+  // full JSON.parse. Matters because the dump groups collections: a --bill-amendment
+  // run would otherwise parse all ~13GB of bill_text lines just to discard them.
+  const selectedPrefixes = COLLECTIONS_TO_INGEST.map((c) => `{"collection":"${c}"`);
+
   const wallStart = performance.now();
   try {
     const rl = createInterface({ input: createReadStream(DUMP_FILE), crlfDelay: Infinity });
     for await (const line of rl) {
-      if (!line.trim()) continue;
+      if (!selectedPrefixes.some((p) => line.startsWith(p))) continue; // skip blanks + other collections
       const rec = JSON.parse(line) as DumpRow;
       const buf = buffers.get(rec.collection);
       if (!buf) continue; // row for a collection we're not ingesting
