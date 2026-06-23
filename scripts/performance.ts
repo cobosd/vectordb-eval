@@ -120,7 +120,7 @@ async function oneShot(): Promise<void> {
   );
 
   const rows: Record<string, { "latency(ms)": number; hits: number; "top score": number }> = {};
-  await Promise.all(SERVICES.map(async (service) => {
+  for (const service of SERVICES) {
     logger.info("Starting service", { service });
     const stores = Object.fromEntries(
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
@@ -178,7 +178,7 @@ async function main() {
   // shows the gap is order-statistics ("slower of two"), not Promise.all overhead.
   const endToEndMax: Record<string, number[]> = {};
 
-  for (const service of SERVICES) {
+  await Promise.all(SERVICES.map(async (service) => {
     logger.info("Starting service", { service });
     const stores = Object.fromEntries(
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
