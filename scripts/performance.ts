@@ -18,6 +18,7 @@ import { COLLECTION_KEYS, type CollectionKey } from "../consts";
 import { embedBatch } from "../utils/embedder";
 import { createStore } from "../utils/vector-indexer";
 import type { ServiceName, VectorStore } from "../utils/vector-store";
+import { appendPerfRows, type PerfCsvRow } from "../utils/perf-csv";
 import { createLogger } from "../logger";
 
 const logger = createLogger("performance");
@@ -278,6 +279,41 @@ async function main() {
     if (endToEndMax[service]) e2eRows[`${service} max(per-collection)`] = stats(endToEndMax[service]!);
   }
   console.table(highlightedStatsTable(e2eRows, winnerKeys(e2eRows, (key) => key.includes("max(per-collection)") ? "max" : "end-to-end")));
+
+  // Persist the per-service end-to-end stats to CSV when a caller (run.sh) sets
+  // PERF_CSV. The whole sweep accumulates into one evals/csv/<timestamp>.csv,
+  // every row stamped with the shared PERF_RUN_AT so the run groups cleanly.
+  await writeCsv(endToEnd);
+}
+
+async function writeCsv(endToEnd: Record<string, number[]>): Promise<void> {
+  const path = process.env.PERF_CSV;
+  if (!path) return;
+  const runAt = process.env.PERF_RUN_AT || new Date().toISOString();
+  const rows: PerfCsvRow[] = SERVICES.filter((s) => endToEnd[s]?.length).map((service) => {
+    const s = stats(endToEnd[service]!);
+    return {
+      run_at: runAt,
+      mode: "unfiltered",
+      topK: TOPK,
+      iters: ITERATIONS,
+      service,
+      consistency: CONSISTENCY,
+      avg_ms: s["avg(ms)"],
+      p50_ms: s["p50(ms)"],
+      p95_ms: s["p95(ms)"],
+      max_ms: s["max(ms)"],
+      min_ms: s["min(ms)"],
+      calls: s.calls,
+      queries: queries.length,
+      sessions: "",
+      since: "",
+      until: "",
+      warm: WARM,
+    };
+  });
+  await appendPerfRows(path, rows);
+  console.log(`\n→ appended ${rows.length} unfiltered row(s) to ${path}`);
 }
 
 main().catch((error) => {

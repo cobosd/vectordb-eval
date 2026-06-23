@@ -36,6 +36,15 @@ for arg in "$@"; do
   esac
 done
 
+# Persist results automatically: one timestamped CSV per ./run.sh invocation.
+# Both performance scripts append their end-to-end rows to it (via PERF_CSV),
+# all stamped with a single run timestamp (PERF_RUN_AT) so the run groups cleanly
+# in the dashboard. Override PERF_CSV to point at a specific file.
+export PERF_RUN_AT="${PERF_RUN_AT:-$(date -u +%Y-%m-%dT%H:%M:%S.000Z)}"
+export PERF_CSV="${PERF_CSV:-evals/csv/$(date +%Y-%m-%d_%H%M%S).csv}"
+mkdir -p "$(dirname "$PERF_CSV")"
+echo "Writing results to $PERF_CSV"
+
 # (topK iterations) pairs to sweep.
 COMBOS=(
   "5 5"
@@ -65,3 +74,8 @@ for consistency in "${CONSISTENCY_LIST[@]}"; do
       --consistency="$consistency" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
   done
 done
+
+echo
+echo "============================================================"
+echo "  Results written to $PERF_CSV"
+echo "============================================================"

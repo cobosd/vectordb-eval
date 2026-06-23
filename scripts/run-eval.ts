@@ -23,6 +23,7 @@ import type {
   ServiceName,
   VectorStore,
 } from "../utils/vector-store";
+import { writePerfCsv, type PerfCsvRow } from "../utils/perf-csv";
 import { logger } from "../logger";
 
 // Keep stdout clean for the JSONL event stream — winston's Console transport
@@ -53,27 +54,6 @@ const DEFAULT_QUERIES = [
   "Healthcare access and Medicaid expansion",
   "Criminal justice reform and sentencing guidelines",
 ];
-
-// Single source of truth for the CSV column order (mirrored in src/lib/perf/csv.ts).
-const CSV_COLUMNS = [
-  "run_at",
-  "mode",
-  "topK",
-  "iters",
-  "service",
-  "consistency",
-  "avg_ms",
-  "p50_ms",
-  "p95_ms",
-  "max_ms",
-  "min_ms",
-  "calls",
-  "queries",
-  "sessions",
-  "since",
-  "until",
-  "warm",
-] as const;
 
 function emit(event: Record<string, unknown>): void {
   process.stdout.write(JSON.stringify(event) + "\n");
@@ -157,11 +137,6 @@ function buildFilter(cfg: RunConfig): QueryFilter {
   ];
 }
 
-function csvEscape(v: unknown): string {
-  const s = String(v ?? "");
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
 function pad(n: number): string {
   return String(n).padStart(2, "0");
 }
@@ -195,8 +170,7 @@ async function main() {
   }
   emit({ type: "embed", ms: round(performance.now() - t0), queries: cfg.queries.length });
 
-  type CsvRow = Record<(typeof CSV_COLUMNS)[number], string | number | boolean>;
-  const rows: CsvRow[] = [];
+  const rows: PerfCsvRow[] = [];
   let completed = 0;
   let failed = 0;
 
@@ -238,7 +212,7 @@ async function main() {
 
             if (!samples.length) throw new Error("no latency samples collected");
             const s = stats(samples);
-            const row: CsvRow = {
+            const row: PerfCsvRow = {
               run_at: runAt,
               mode,
               topK,
@@ -296,11 +270,7 @@ async function main() {
   const file = `${stamp}.csv`;
   const dir = `${process.cwd()}/evals/csv`;
   const path = `${dir}/${file}`;
-  const header = CSV_COLUMNS.join(",");
-  const body = rows
-    .map((r) => CSV_COLUMNS.map((col) => csvEscape(r[col])).join(","))
-    .join("\n");
-  await Bun.write(path, `${header}\n${body}\n`);
+  await writePerfCsv(path, rows);
 
   emit({ type: "run-done", csvFile: file, csvPath: path, rows: rows.length, failed });
   // Sockets (OpenAI/undici keep-alive) can keep the loop alive; exit explicitly
