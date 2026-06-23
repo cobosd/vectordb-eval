@@ -13,6 +13,9 @@
  *   bun scripts/performance-filtered.ts --session=2163 --since=2026-06-10 --topk=20 --iterations=50
  *   # multiple sessions (session_id IN [...]) + a bounded date window (since <= date <= until):
  *   bun scripts/performance-filtered.ts --sessions=2176,2244,2189 --since=2026-05-15 --until=2026-06-10
+ *   # exercise one predicate at a time (--filter=session|time|both, default both):
+ *   bun scripts/performance-filtered.ts --filter=session
+ *   bun scripts/performance-filtered.ts --filter=time --since=2026-06-10
  */
 
 import { COLLECTION_KEYS, type CollectionKey } from "../consts";
@@ -39,7 +42,7 @@ const flag = (name: string, fallback: string): string => {
   return found ? found.slice(name.length + 3) : fallback;
 };
 
-const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "session", "sessions", "since", "until", "warm"]);
+const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "filter", "session", "sessions", "since", "until", "warm"]);
 const unknown = args
   .filter((a) => a.startsWith("--"))
   .map((a) => a.slice(2).split("=")[0]!)
@@ -55,6 +58,15 @@ const TOPK = Number(flag("topk", "20"));
 const ITERATIONS = Number(flag("iterations", "50"));
 const SERVICES = flag("services", "turbopuffer,pinecone").split(",").filter(Boolean) as ServiceName[];
 const CONSISTENCY = flag("consistency", "strong") as "strong" | "eventual";
+// Which predicate to exercise: session_id only, notification_action_time only, or
+// both ANDed (the original combined filter). Splitting them isolates how each
+// predicate's selectivity drives latency — a session id is highly selective, a
+// since-date typically matches far more rows.
+const FILTER_KIND = flag("filter", "both") as "session" | "time" | "both";
+if (!["session", "time", "both"].includes(FILTER_KIND)) {
+  console.error(`Invalid --filter: "${FILTER_KIND}". Expected one of: session, time, both.`);
+  process.exit(1);
+}
 // Native cache prewarm (Turbopuffer) is off by default; --warm enables it.
 const WARM = args.includes("--warm");
 
@@ -86,17 +98,35 @@ if (UNTIL_EPOCH && UNTIL_EPOCH <= SINCE_EPOCH) {
   process.exit(1);
 }
 
-// Numeric filter both backends run identically: session_id eq/in + an epoch range
-// (lower bound always, upper bound when --until is given → bounded date window).
-const FILTER: QueryFilter = [
+// Numeric clauses both backends run identically. --filter picks which apply:
+//   session → session_id eq/in only
+//   time    → notification_action_time_epoch range only (lower bound, +upper if --until)
+//   both    → both, ANDed (the original combined filter)
+const SESSION_CLAUSE: QueryFilter[number] =
   SESSIONS.length === 1
     ? { field: "session_id", op: "eq", value: SESSIONS[0]! }
-    : { field: "session_id", op: "in", value: SESSIONS },
+    : { field: "session_id", op: "in", value: SESSIONS };
+const TIME_CLAUSES: QueryFilter = [
   { field: "notification_action_time_epoch", op: "gte", value: SINCE_EPOCH },
   ...(UNTIL_EPOCH
     ? [{ field: "notification_action_time_epoch", op: "lte", value: UNTIL_EPOCH } satisfies QueryFilter[number]]
     : []),
 ];
+const FILTER: QueryFilter =
+  FILTER_KIND === "session"
+    ? [SESSION_CLAUSE]
+    : FILTER_KIND === "time"
+      ? TIME_CLAUSES
+      : [SESSION_CLAUSE, ...TIME_CLAUSES];
+
+// CSV identity + provenance for this filter kind. `both` keeps the legacy
+// "filtered" mode; the split kinds get their own mode so dashboard rows don't
+// collide on (mode, topK, iters, service, consistency). Each records only the
+// metadata it actually filtered on.
+const CSV_MODE = FILTER_KIND === "both" ? "filtered" : `filtered-${FILTER_KIND}`;
+const CSV_SESSIONS = FILTER_KIND === "time" ? "" : SESSIONS.join(" ");
+const CSV_SINCE = FILTER_KIND === "session" ? "" : SINCE;
+const CSV_UNTIL = FILTER_KIND === "session" ? "" : UNTIL;
 
 const round = (n: number) => Math.round(n * 10) / 10;
 
@@ -184,6 +214,7 @@ async function main() {
     services: SERVICES,
     topK: TOPK,
     consistency: CONSISTENCY,
+    filterKind: FILTER_KIND,
     filter: { sessions: SESSIONS, since: SINCE, until: UNTIL || undefined },
   });
   const [vectors, embedMs] = await timeIt(() => embedBatch(queries));
@@ -192,9 +223,13 @@ async function main() {
   const dateClause = UNTIL_EPOCH
     ? `${SINCE_EPOCH} (${SINCE}) <= notification_action_time_epoch <= ${UNTIL_EPOCH} (${UNTIL})`
     : `notification_action_time_epoch >= ${SINCE_EPOCH} (${SINCE})`;
+  const filterDesc =
+    FILTER_KIND === "session" ? sessionClause
+    : FILTER_KIND === "time" ? dateClause
+    : `${sessionClause} AND ${dateClause}`;
   console.log(
     `\nEmbedded ${queries.length} queries in ${round(embedMs)}ms. ` +
-      `Filter: ${sessionClause} AND ${dateClause}\n`,
+      `Filter [${FILTER_KIND}]: ${filterDesc}\n`,
   );
 
   const perCall: Record<string, number[]> = {};
@@ -271,7 +306,7 @@ async function writeCsv(endToEnd: Record<string, number[]>): Promise<void> {
     const s = stats(endToEnd[service]!);
     return {
       run_at: runAt,
-      mode: "filtered",
+      mode: CSV_MODE,
       topK: TOPK,
       iters: ITERATIONS,
       service,
@@ -283,14 +318,14 @@ async function writeCsv(endToEnd: Record<string, number[]>): Promise<void> {
       min_ms: s["min(ms)"],
       calls: s.calls,
       queries: queries.length,
-      sessions: SESSIONS.join(" "),
-      since: SINCE,
-      until: UNTIL,
+      sessions: CSV_SESSIONS,
+      since: CSV_SINCE,
+      until: CSV_UNTIL,
       warm: WARM,
     };
   });
   await appendPerfRows(path, rows);
-  console.log(`\n→ appended ${rows.length} filtered row(s) to ${path}`);
+  console.log(`\n→ appended ${rows.length} ${CSV_MODE} row(s) to ${path}`);
 }
 
 main().catch((error) => {

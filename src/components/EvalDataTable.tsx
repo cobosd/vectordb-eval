@@ -195,6 +195,8 @@ export function EvalDataTable({ rows }: { rows: EvalRow[] }) {
           options={[
             { value: "unfiltered", label: "Unfiltered" },
             { value: "filtered", label: "Filtered" },
+            { value: "filtered-session", label: "Filter: session" },
+            { value: "filtered-time", label: "Filter: time" },
           ]}
         />
         <FilterSelect
