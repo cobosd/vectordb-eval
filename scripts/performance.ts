@@ -105,6 +105,46 @@ function stats(samples: number[]) {
 
 const round = (n: number) => Math.round(n * 10) / 10;
 
+type StatsRow = ReturnType<typeof stats>;
+
+const HIGHLIGHT = "\x1b[102m";
+const RESET = "\x1b[0m";
+
+function color(value: string | number): string {
+  return `${HIGHLIGHT}${value}${RESET}`;
+}
+
+function sortedTable<T>(rows: Record<string, T>): Record<string, T> {
+  return Object.fromEntries(Object.entries(rows).sort(([a], [b]) => a.localeCompare(b))) as Record<string, T>;
+}
+
+function winnerKeys(rows: Record<string, StatsRow>, group: (key: string) => string): Set<string> {
+  const best = new Map<string, { key: string; avg: number }>();
+  for (const [key, row] of Object.entries(rows)) {
+    const groupKey = group(key);
+    const avg = row["avg(ms)"];
+    const current = best.get(groupKey);
+    if (!current || avg < current.avg || (avg === current.avg && key.localeCompare(current.key) < 0)) {
+      best.set(groupKey, { key, avg });
+    }
+  }
+  return new Set([...best.values()].map((v) => v.key));
+}
+
+function highlightedStatsTable(rows: Record<string, StatsRow>, winners: Set<string>): Record<string, StatsRow | Record<string, string>> {
+  return Object.fromEntries(
+    Object.entries(rows)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, row]) => {
+        if (!winners.has(key)) return [key, row];
+        return [
+          color(key),
+          Object.fromEntries(Object.entries(row).map(([field, value]) => [field, color(value)])),
+        ];
+      }),
+  );
+}
+
 /**
  * One-shot mode (--query="..."): embed the query once, then run it a single time
  * against each collection of each selected service, reporting that single call's
@@ -121,7 +161,6 @@ async function oneShot(): Promise<void> {
 
   const rows: Record<string, { "latency(ms)": number; hits: number; "top score": number }> = {};
   for (const service of SERVICES) {
-    logger.info("Starting service", { service });
     const stores = Object.fromEntries(
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
@@ -151,7 +190,7 @@ async function oneShot(): Promise<void> {
   }
 
   console.log("Single-run query latency:");
-  console.table(rows);
+  console.table(sortedTable(rows));
 }
 
 async function main() {
@@ -179,7 +218,6 @@ async function main() {
   const endToEndMax: Record<string, number[]> = {};
 
   await Promise.all(SERVICES.map(async (service) => {
-    logger.info("Starting service", { service });
     const stores = Object.fromEntries(
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
@@ -227,11 +265,11 @@ async function main() {
         (endToEndMax[service] ??= []).push(Math.max(...components));
       }
     }
-    logger.info("Finished service", { service });
   }));
 
   console.log("Per-collection query latency:");
-  console.table(Object.fromEntries(Object.entries(perCall).map(([k, v]) => [k, stats(v)])));
+  const perCollectionRows = Object.fromEntries(Object.entries(perCall).map(([k, v]) => [k, stats(v)]));
+  console.table(highlightedStatsTable(perCollectionRows, winnerKeys(perCollectionRows, (key) => key.split(":")[1] ?? key)));
 
   console.log("\nEnd-to-end search latency (both collections in parallel):");
   const e2eRows: Record<string, ReturnType<typeof stats>> = {};
@@ -239,7 +277,7 @@ async function main() {
     if (endToEnd[service]) e2eRows[`${service} end-to-end`] = stats(endToEnd[service]!);
     if (endToEndMax[service]) e2eRows[`${service} max(per-collection)`] = stats(endToEndMax[service]!);
   }
-  console.table(e2eRows);
+  console.table(highlightedStatsTable(e2eRows, winnerKeys(e2eRows, (key) => key.includes("max(per-collection)") ? "max" : "end-to-end")));
 }
 
 main().catch((error) => {
