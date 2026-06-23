@@ -105,6 +105,24 @@ async function timeIt<T>(fn: () => Promise<T>): Promise<[T, number]> {
   return [result, performance.now() - start];
 }
 
+// Surface a hanging call instead of stalling the benchmark indefinitely.
+const QUERY_TIMEOUT_MS = 20_000;
+function withTimeout<T>(label: string, promise: Promise<T>, ms = QUERY_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 function stats(samples: number[]) {
   const sorted = [...samples].sort((a, b) => a - b);
   const pct = (p: number) => sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))]!;
@@ -145,7 +163,8 @@ async function main() {
 
   const queryOpts = { topK: TOPK, consistency: CONSISTENCY, filter: FILTER };
 
-  for (const service of SERVICES) {
+  await Promise.all(SERVICES.map(async (service) => {
+    logger.info("Starting service", { service });
     const stores = Object.fromEntries(
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
@@ -154,8 +173,7 @@ async function main() {
     if (WARM) await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
     await Promise.all(
       COLLECTION_KEYS.map((c) =>
-        stores[c]
-          .query(vectors[0]!, queryOpts)
+        withTimeout(`${service}:${c} warmup`, stores[c].query(vectors[0]!, queryOpts))
           .then((hits) => (hitCounts[`${service}:${c}`] = hits.length))
           .catch(() => []),
       ),
@@ -164,14 +182,16 @@ async function main() {
     for (let iter = 0; iter < ITERATIONS; iter++) {
       for (const vector of vectors) {
         for (const collection of COLLECTION_KEYS) {
-          const [, ms] = await timeIt(() => stores[collection].query(vector, queryOpts));
+          const label = `${service}:${collection}`;
+          const [, ms] = await timeIt(() => withTimeout(label, stores[collection].query(vector, queryOpts)));
           (perCall[`${service}:${collection}`] ??= []).push(ms);
         }
         const components: number[] = [];
         const [, combined] = await timeIt(() =>
           Promise.all(
             COLLECTION_KEYS.map(async (collection) => {
-              const [, ms] = await timeIt(() => stores[collection].query(vector, queryOpts));
+              const label = `${service}:${collection} parallel`;
+              const [, ms] = await timeIt(() => withTimeout(label, stores[collection].query(vector, queryOpts)));
               components.push(ms);
             }),
           ),
@@ -180,7 +200,8 @@ async function main() {
         (endToEndMax[service] ??= []).push(Math.max(...components));
       }
     }
-  }
+    logger.info("Finished service", { service });
+  }));
 
   console.log("Hits matching the filter (first query, topK):");
   console.table(hitCounts);

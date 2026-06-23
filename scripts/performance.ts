@@ -120,7 +120,8 @@ async function oneShot(): Promise<void> {
   );
 
   const rows: Record<string, { "latency(ms)": number; hits: number; "top score": number }> = {};
-  for (const service of SERVICES) {
+  await Promise.all(SERVICES.map(async (service) => {
+    logger.info("Starting service", { service });
     const stores = Object.fromEntries(
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
@@ -178,6 +179,7 @@ async function main() {
   const endToEndMax: Record<string, number[]> = {};
 
   for (const service of SERVICES) {
+    logger.info("Starting service", { service });
     const stores = Object.fromEntries(
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
@@ -187,14 +189,22 @@ async function main() {
     // Always prime the HTTP connection with a throwaway query (not measured) so the
     // first measured call doesn't pay TLS/connection setup.
     await Promise.all(
-      COLLECTION_KEYS.map((c) => stores[c].query(vectors[0]!, { topK: TOPK, consistency: CONSISTENCY }).catch(() => [])),
+      COLLECTION_KEYS.map((c) =>
+        withTimeout(
+          `${service}:${c} warmup`,
+          stores[c].query(vectors[0]!, { topK: TOPK, consistency: CONSISTENCY }),
+        ).catch(() => []),
+      ),
     );
 
     for (let iter = 0; iter < ITERATIONS; iter++) {
       for (const vector of vectors) {
         // Isolated per-collection timing (sequential).
         for (const collection of COLLECTION_KEYS) {
-          const [, ms] = await timeIt(() => stores[collection].query(vector, { topK: TOPK, consistency: CONSISTENCY }));
+          const label = `${service}:${collection}`;
+          const [, ms] = await timeIt(() =>
+            withTimeout(label, stores[collection].query(vector, { topK: TOPK, consistency: CONSISTENCY })),
+          );
           (perCall[`${service}:${collection}`] ??= []).push(ms);
         }
 
@@ -205,7 +215,10 @@ async function main() {
         const [, combined] = await timeIt(() =>
           Promise.all(
             COLLECTION_KEYS.map(async (collection) => {
-              const [, ms] = await timeIt(() => stores[collection].query(vector, { topK: TOPK, consistency: CONSISTENCY }));
+              const label = `${service}:${collection} parallel`;
+              const [, ms] = await timeIt(() =>
+                withTimeout(label, stores[collection].query(vector, { topK: TOPK, consistency: CONSISTENCY })),
+              );
               components.push(ms);
             }),
           ),
@@ -214,7 +227,8 @@ async function main() {
         (endToEndMax[service] ??= []).push(Math.max(...components));
       }
     }
-  }
+    logger.info("Finished service", { service });
+  }));
 
   console.log("Per-collection query latency:");
   console.table(Object.fromEntries(Object.entries(perCall).map(([k, v]) => [k, stats(v)])));
