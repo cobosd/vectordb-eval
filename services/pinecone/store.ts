@@ -152,12 +152,12 @@ export class PineconeStore implements VectorStore {
   }
 
   async query(vector: number[], options: QueryOptions = {}): Promise<QueryHit[]> {
-    const { topK = 10, filter } = options;
+    const { topK = 10, filter, minimal } = options;
     // Default namespace — matches how upsert() writes (no namespace override).
     const res = await getPinecone().index(this.indexName).query({
       vector,
       topK,
-      includeMetadata: true,
+      includeMetadata: !minimal, // minimal: id + score only
       includeValues: false, // never ship the raw vector back — inflates payload, esp. at high topK
       ...(filter ? { filter: toPineconeFilter(filter) } : {}),
     });

@@ -151,11 +151,13 @@ export class QdrantStore implements VectorStore {
   }
 
   async query(vector: number[], options: QueryOptions = {}): Promise<QueryHit[]> {
-    const { topK = 10, filter } = options;
+    const { topK = 10, filter, minimal } = options;
     const res = await getQdrant().query(this.collection, {
       query: vector,
       limit: topK,
-      with_payload: true,
+      // minimal: return only the id field (the real row id lives in payload under
+      // ROW_ID_KEY; with_payload:false would surface Qdrant's internal point id).
+      with_payload: minimal ? [ROW_ID_KEY] : true,
       with_vector: false, // never ship the raw vector back — inflates payload
       ...(filter ? { filter: toQdrantFilter(filter) } : {}),
     });
