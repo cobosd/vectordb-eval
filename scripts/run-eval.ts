@@ -20,10 +20,11 @@ import { createStore } from "../utils/vector-indexer";
 import { toEpoch } from "../utils/bill-metadata";
 import type {
   QueryFilter,
+  QueryPerf,
   ServiceName,
   VectorStore,
 } from "../utils/vector-store";
-import { writePerfCsv, type PerfCsvRow } from "../utils/perf-csv";
+import { aggregatePerf, writePerfCsv, type PerfCsvRow } from "../utils/perf-csv";
 import { logger } from "../logger";
 
 // Keep stdout clean for the JSONL event stream — winston's Console transport
@@ -199,11 +200,15 @@ async function main() {
               COLLECTION_KEYS.map((c) => stores[c].query(vectors[0]!, opts).catch(() => []))
             );
 
+            // Collect server-side diagnostics from the measured calls only (the
+            // unmeasured prime above is excluded so a cold prime doesn't skew them).
+            const perf: QueryPerf[] = [];
+            const measuredOpts = { ...opts, onPerf: (p: QueryPerf) => perf.push(p) };
             const samples: number[] = [];
             for (let i = 0; i < iters; i++) {
               for (const vector of vectors) {
                 const ms = await timeIt(() =>
-                  Promise.all(COLLECTION_KEYS.map((c) => stores[c].query(vector, opts)))
+                  Promise.all(COLLECTION_KEYS.map((c) => stores[c].query(vector, measuredOpts)))
                 );
                 samples.push(ms);
               }
@@ -230,6 +235,7 @@ async function main() {
               since: mode === "filtered" ? cfg.since : "",
               until: mode === "filtered" ? cfg.until ?? "" : "",
               warm: cfg.warm,
+              ...aggregatePerf(perf),
             };
             rows.push(row);
             completed++;

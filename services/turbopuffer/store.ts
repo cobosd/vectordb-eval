@@ -52,22 +52,44 @@ function toTurbopufferFilter(filter: QueryFilter): unknown {
 const VECTOR_FIELD = { type: `[${EMBEDDING_DIMENSIONS}]f32`, ann: true } as const;
 
 // Vector-only namespaces: no BM25/full-text-search indexes (queries are pure ANN,
-// so FTS would just cost ingest time + storage). chunk_text/summary are large and
-// never filtered, so mark them filterable:false for the 50% storage discount.
-// Each namespace declares its own date field.
+// so FTS would just cost ingest time + storage).
+//
+// Every attribute written by buildBillMetadata is declared explicitly rather than
+// left to Turbopuffer's type inference, for two reasons:
+//   1. The fields we actually filter on (session_id, notification_action_time_epoch)
+//      get a guaranteed numeric type + attribute index — a range filter on an
+//      inferred-string epoch would be both wrong and slow.
+//   2. Fields we never filter (large text, urls, flags, the human-readable date)
+//      are marked filterable:false so Turbopuffer skips building useless attribute
+//      indexes (also a ~50% storage discount on the big string columns).
+// session_id is the selective equality predicate; the epoch is the range predicate.
 const SCHEMA_TEXT = {
   vector: VECTOR_FIELD,
   chunk_text: { type: "string", filterable: false },
   summary: { type: "string", filterable: false },
   bill_number_normalized: { type: "string" },
-  bill_text_date: { type: "string" },
+  session_id: { type: "uint" },
+  notification_action_time_epoch: { type: "int" },
+  notification_action_time: { type: "string", filterable: false },
+  has_dead_progress_status: { type: "bool", filterable: false },
+  is_active: { type: "bool", filterable: false },
+  hide: { type: "bool", filterable: false },
+  s3_url: { type: "string", filterable: false },
+  bill_text_date: { type: "string", filterable: false },
 } as const;
 const SCHEMA_AMENDMENT = {
   vector: VECTOR_FIELD,
   chunk_text: { type: "string", filterable: false },
   summary: { type: "string", filterable: false },
   bill_number_normalized: { type: "string" },
-  amendment_date: { type: "string" },
+  session_id: { type: "uint" },
+  notification_action_time_epoch: { type: "int" },
+  notification_action_time: { type: "string", filterable: false },
+  has_dead_progress_status: { type: "bool", filterable: false },
+  is_active: { type: "bool", filterable: false },
+  hide: { type: "bool", filterable: false },
+  s3_url: { type: "string", filterable: false },
+  amendment_date: { type: "string", filterable: false },
 } as const;
 
 /** Per-collection Turbopuffer schema (namespace name comes from consts). */
@@ -137,7 +159,7 @@ export class TurbopufferStore implements VectorStore {
   }
 
   async query(vector: number[], options: QueryOptions = {}): Promise<QueryHit[]> {
-    const { topK = 10, consistency = "eventual", filter, minimal } = options;
+    const { topK = 10, consistency = "eventual", filter, minimal, onPerf } = options;
     const result = await this.ns().query({
       rank_by: ["vector", "ANN", vector],
       limit: topK,
@@ -151,6 +173,24 @@ export class TurbopufferStore implements VectorStore {
       consistency: { level: consistency },
       ...(filter ? { filters: toTurbopufferFilter(filter) as never } : {}),
     });
+    // Surface the server-side diagnostics so callers can tell cache warmth and
+    // exhaustive (unindexed) scanning apart from genuine filter/search cost.
+    if (onPerf) {
+      const perf = (result as { performance?: Record<string, unknown> }).performance;
+      const n = (v: unknown) => (typeof v === "number" ? v : undefined);
+      const s = (v: unknown) => (typeof v === "string" ? v : undefined);
+      if (perf) {
+        onPerf({
+          cacheTemperature: s(perf.cache_temperature),
+          cacheHitRatio: n(perf.cache_hit_ratio),
+          serverTotalMs: n(perf.server_total_ms),
+          queryExecutionMs: n(perf.query_execution_ms),
+          exhaustiveSearchCount: n(perf.exhaustive_search_count),
+          approxNamespaceSize: n(perf.approx_namespace_size),
+          lastIncludedWriteAt: s(perf.last_included_write_at),
+        });
+      }
+    }
     return (result.rows ?? []).map((row) => ({
       id: String(row.id),
       // cosine_distance → cosine similarity, so it matches Pinecone's scoring.
