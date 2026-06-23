@@ -128,7 +128,7 @@ export class OpenSearchStore implements VectorStore {
   }
 
   async query(vector: number[], options: QueryOptions = {}): Promise<QueryHit[]> {
-    const { topK = 10, filter } = options;
+    const { topK = 10, filter, minimal } = options;
     const knn: Record<string, unknown> = {
       [VECTOR_FIELD]: { vector, k: topK, ...(filter ? { filter: toOpenSearchFilter(filter) } : {}) },
     };
@@ -137,7 +137,9 @@ export class OpenSearchStore implements VectorStore {
       body: {
         size: topK,
         query: { knn },
-        _source: { excludes: [VECTOR_FIELD] }, // never ship the raw vector back
+        // minimal: return no _source at all (id + score only). Otherwise all
+        // fields except the raw vector.
+        _source: minimal ? false : { excludes: [VECTOR_FIELD] },
       },
     });
     return (body.hits?.hits ?? []).map((hit: any) => ({

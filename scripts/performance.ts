@@ -12,6 +12,7 @@
  *   bun scripts/performance.ts "renewable energy incentives" "background check rules"
  *   bun scripts/performance.ts --query="school funding"   # run one query once per service
  *   bun scripts/performance.ts --warm                     # opt into native cache prewarm
+ *   bun scripts/performance.ts --minimal                  # return ids only (no metadata payload)
  */
 
 import { COLLECTION_KEYS, type CollectionKey } from "../consts";
@@ -39,7 +40,7 @@ const flag = (name: string, fallback: string): string => {
 
 // Reject unknown flags so typos / unimplemented options fail loudly instead of
 // being silently ignored.
-const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "query", "warm"]);
+const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "query", "warm", "minimal"]);
 const unknown = args
   .filter((a) => a.startsWith("--"))
   .map((a) => a.slice(2).split("=")[0]!)
@@ -65,6 +66,10 @@ const CONSISTENCY = flag("consistency", "strong") as "strong" | "eventual";
 const ONESHOT = flag("query", "");
 // Native cache prewarm (Turbopuffer hintCacheWarm) is off by default; --warm enables it.
 const WARM = args.includes("--warm");
+// --minimal: return only document ids (no metadata) to isolate search latency
+// from response-payload cost. Shared by every query() call below.
+const MINIMAL = args.includes("--minimal");
+const QUERY_OPTS = { topK: TOPK, consistency: CONSISTENCY, minimal: MINIMAL };
 
 async function timeIt<T>(fn: () => Promise<T>): Promise<[T, number]> {
   const start = performance.now();
@@ -175,7 +180,7 @@ async function oneShot(): Promise<void> {
       logger.info("Querying", { label });
       try {
         const [hits, ms] = await timeIt(() =>
-          withTimeout(label, stores[collection].query(vector, { topK: TOPK, consistency: CONSISTENCY })),
+          withTimeout(label, stores[collection].query(vector, QUERY_OPTS)),
         );
         logger.info("Query done", { label, ms: round(ms), hits: hits.length });
         rows[label] = {
@@ -206,7 +211,8 @@ async function main() {
   const [vectors, embedMs] = await timeIt(() => embedBatch(queries));
   console.log(
     `\nEmbedded ${queries.length} queries in ${round(embedMs)}ms ` +
-      `(${round(embedMs / queries.length)}ms/query, shared across services)\n`,
+      `(${round(embedMs / queries.length)}ms/query, shared across services)` +
+      `${MINIMAL ? " · minimal: id-only" : ""}\n`,
   );
 
   // service:collection -> isolated per-call latencies
@@ -231,7 +237,7 @@ async function main() {
       COLLECTION_KEYS.map((c) =>
         withTimeout(
           `${service}:${c} warmup`,
-          stores[c].query(vectors[0]!, { topK: TOPK, consistency: CONSISTENCY }),
+          stores[c].query(vectors[0]!, QUERY_OPTS),
         ).catch(() => []),
       ),
     );
@@ -242,7 +248,7 @@ async function main() {
         for (const collection of COLLECTION_KEYS) {
           const label = `${service}:${collection}`;
           const [, ms] = await timeIt(() =>
-            withTimeout(label, stores[collection].query(vector, { topK: TOPK, consistency: CONSISTENCY })),
+            withTimeout(label, stores[collection].query(vector, QUERY_OPTS)),
           );
           (perCall[`${service}:${collection}`] ??= []).push(ms);
         }
@@ -256,7 +262,7 @@ async function main() {
             COLLECTION_KEYS.map(async (collection) => {
               const label = `${service}:${collection} parallel`;
               const [, ms] = await timeIt(() =>
-                withTimeout(label, stores[collection].query(vector, { topK: TOPK, consistency: CONSISTENCY })),
+                withTimeout(label, stores[collection].query(vector, QUERY_OPTS)),
               );
               components.push(ms);
             }),

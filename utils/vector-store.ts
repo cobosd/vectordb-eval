@@ -44,6 +44,12 @@ export type QueryOptions = {
   consistency?: "strong" | "eventual";
   /** Metadata pre-filter applied before/with the vector search. */
   filter?: QueryFilter;
+  /**
+   * Return only document ids + score — no metadata, no vectors. Isolates raw
+   * search latency from response-payload cost (e.g. large chunk_text/summary
+   * fields), matching Turbopuffer's "control include_attributes" guidance.
+   */
+  minimal?: boolean;
 };
 
 /**

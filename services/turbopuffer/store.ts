@@ -137,14 +137,15 @@ export class TurbopufferStore implements VectorStore {
   }
 
   async query(vector: number[], options: QueryOptions = {}): Promise<QueryHit[]> {
-    const { topK = 10, consistency = "eventual", filter } = options;
+    const { topK = 10, consistency = "eventual", filter, minimal } = options;
     const result = await this.ns().query({
       rank_by: ["vector", "ANN", vector],
       limit: topK,
-      // All metadata EXCEPT the raw vector. We exclude "vector" rather than pass
-      // include_attributes:true, because true also returns the 1536-dim vector per
-      // hit (~20KB/row) and dominates the response payload.
-      exclude_attributes: ["vector"],
+      // minimal: return nothing but id + $dist. Otherwise all metadata EXCEPT the
+      // raw vector — exclude "vector" rather than include_attributes:true, since
+      // true also returns the 1536-dim vector per hit (~20KB/row) and dominates
+      // the response payload.
+      ...(minimal ? { include_attributes: false } : { exclude_attributes: ["vector"] }),
       // Eventual by default: skips strong consistency's object-storage round-trip
       // and matches Pinecone serverless (also eventual).
       consistency: { level: consistency },

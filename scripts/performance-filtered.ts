@@ -16,6 +16,8 @@
  *   # exercise one predicate at a time (--filter=session|time|both, default both):
  *   bun scripts/performance-filtered.ts --filter=session
  *   bun scripts/performance-filtered.ts --filter=time --since=2026-06-10
+ *   # return ids only (no metadata) to isolate search latency from payload cost:
+ *   bun scripts/performance-filtered.ts --minimal --filter=time
  */
 
 import { COLLECTION_KEYS, type CollectionKey } from "../consts";
@@ -42,7 +44,7 @@ const flag = (name: string, fallback: string): string => {
   return found ? found.slice(name.length + 3) : fallback;
 };
 
-const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "filter", "session", "sessions", "since", "until", "warm"]);
+const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "filter", "session", "sessions", "since", "until", "warm", "minimal"]);
 const unknown = args
   .filter((a) => a.startsWith("--"))
   .map((a) => a.slice(2).split("=")[0]!)
@@ -69,6 +71,9 @@ if (!["session", "time", "both"].includes(FILTER_KIND)) {
 }
 // Native cache prewarm (Turbopuffer) is off by default; --warm enables it.
 const WARM = args.includes("--warm");
+// --minimal: return only document ids (no metadata) to isolate search latency
+// from response-payload cost.
+const MINIMAL = args.includes("--minimal");
 
 // --sessions=2176,2244 (preferred) or --session=2176 (single, back-compat).
 const SESSIONS = flag("sessions", flag("session", "2163"))
@@ -229,7 +234,7 @@ async function main() {
     : `${sessionClause} AND ${dateClause}`;
   console.log(
     `\nEmbedded ${queries.length} queries in ${round(embedMs)}ms. ` +
-      `Filter [${FILTER_KIND}]: ${filterDesc}\n`,
+      `Filter [${FILTER_KIND}]${MINIMAL ? " (minimal: id-only)" : ""}: ${filterDesc}\n`,
   );
 
   const perCall: Record<string, number[]> = {};
@@ -237,7 +242,7 @@ async function main() {
   const endToEndMax: Record<string, number[]> = {};
   const hitCounts: Record<string, number> = {};
 
-  const queryOpts = { topK: TOPK, consistency: CONSISTENCY, filter: FILTER };
+  const queryOpts = { topK: TOPK, consistency: CONSISTENCY, filter: FILTER, minimal: MINIMAL };
 
   await Promise.all(SERVICES.map(async (service) => {
     const stores = Object.fromEntries(
