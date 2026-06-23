@@ -40,8 +40,13 @@ export function createStore(service: ServiceName, collection: CollectionKey): Ve
  * Fans vector rows out to one or more backends for a single collection.
  * Defaults to all registered services; pass `services` to target a subset.
  */
+/** Cumulative ingest cost for one backend: wall time spent in upsert + rows written. */
+export type ServiceTiming = { service: ServiceName; ms: number; rows: number };
+
 export class VectorIndexer {
   private readonly stores: VectorStore[];
+  // Per-service cumulative time spent inside upsert() and rows written, for benchmarking.
+  private readonly timings = new Map<ServiceName, { ms: number; rows: number }>();
 
   constructor(collection: CollectionKey, options: { services?: ServiceName[] } = {}) {
     const services = options.services ?? ALL_SERVICES;
@@ -51,6 +56,14 @@ export class VectorIndexer {
   /** Backends this indexer writes to. */
   get services(): ServiceName[] {
     return this.stores.map((s) => s.service);
+  }
+
+  /** Per-service cumulative upsert time and row count gathered so far. */
+  getTimings(): ServiceTiming[] {
+    return this.stores.map((s) => {
+      const t = this.timings.get(s.service) ?? { ms: 0, rows: 0 };
+      return { service: s.service, ms: t.ms, rows: t.rows };
+    });
   }
 
   async ensure(): Promise<void> {
@@ -63,7 +76,19 @@ export class VectorIndexer {
 
   async upsert(rows: VectorRow[]): Promise<void> {
     if (rows.length === 0) return;
-    await Promise.all(this.stores.map((s) => s.upsert(rows)));
+    // Each store is timed independently so per-service cost is captured even when
+    // they run concurrently (wall-clock per flush is the slowest store).
+    await Promise.all(
+      this.stores.map(async (s) => {
+        const start = performance.now();
+        await s.upsert(rows);
+        const elapsed = performance.now() - start;
+        const t = this.timings.get(s.service) ?? { ms: 0, rows: 0 };
+        t.ms += elapsed;
+        t.rows += rows.length;
+        this.timings.set(s.service, t);
+      }),
+    );
     logger.debug("Upserted", { services: this.services, rows: rows.length });
   }
 }

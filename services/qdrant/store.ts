@@ -31,7 +31,9 @@ const logger = createLogger("qdrant");
 const DISTANCE_METRIC = "Cosine" as const;
 // Payload key holding the original composite row id (Qdrant point ids are UUIDs).
 const ROW_ID_KEY = "__row_id";
-// Qdrant accepts large upserts, but keep request bodies bounded.
+// Cap per request. Our points carry the 1536-dim vector plus full chunk_text +
+// summary, so ~1000/request exceeds Qdrant's default ~32MB request-size limit
+// (it 400s). 500 keeps the body comfortably under it.
 const UPSERT_BATCH = 500;
 // Integer payload fields the filtered benchmark queries — indexed for fast filtering.
 const INDEXED_INT_FIELDS = ["session_id", "notification_action_time_epoch"] as const;
@@ -124,7 +126,18 @@ export class QdrantStore implements VectorStore {
         // Keep the original composite id so query results return it verbatim.
         payload: { ...r.metadata, [ROW_ID_KEY]: r.id },
       }));
-      await qd.upsert(this.collection, { wait: true, points });
+      try {
+        await qd.upsert(this.collection, { wait: true, points });
+      } catch (error: any) {
+        // The Qdrant client surfaces a bare "Bad Request"; pull out the real reason.
+        logger.error("Upsert failed", {
+          collection: this.collection,
+          batch: points.length,
+          status: error?.status,
+          detail: error?.data?.status?.error ?? error?.data ?? error?.message,
+        });
+        throw error;
+      }
     }
   }
 

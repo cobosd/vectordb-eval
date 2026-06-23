@@ -23,8 +23,8 @@ import { getOpenSearch } from "./client";
 const logger = createLogger("opensearch");
 
 const VECTOR_FIELD = "vector";
-// OpenSearch bulk handles large bodies, but keep request size bounded.
-const UPSERT_BATCH = 500;
+// OpenSearch bulk handles large bodies; match the ingest flush size so each flush is one bulk request.
+const UPSERT_BATCH = 1000;
 
 /** Index settings + mapping: a cosine HNSW knn_vector plus typed filter fields. */
 function indexBody() {
