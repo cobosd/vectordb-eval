@@ -17,9 +17,14 @@ import type {
   VectorStore,
 } from "../../utils/vector-store";
 import { createLogger } from "../../logger";
+import { encodeVector } from "../../utils/vector-cache";
 import { getTurbopuffer } from "./client";
 
 const logger = createLogger("turbopuffer");
+
+// TPUF_DEBUG=1 logs the wall time of each write() (includes any SDK retry/back-off),
+// to compare against the per-HTTP-attempt latency logged in client.ts.
+const TPUF_DEBUG = process.env.TPUF_DEBUG === "1";
 
 const DISTANCE_METRIC = "cosine_distance" as const;
 // Reserved row keys that aren't user metadata attributes.
@@ -41,17 +46,24 @@ function toTurbopufferFilter(filter: QueryFilter): unknown {
   return clauses.length === 1 ? clauses[0] : ["And", clauses];
 }
 
+// Declare the vector column explicitly so base64-encoded vectors (see upsert) are
+// unambiguous: the dimension + f32 element type are stated rather than inferred from
+// the wire bytes. `vector` is the conventional name Turbopuffer auto-ANN-indexes.
+const VECTOR_FIELD = { type: `[${EMBEDDING_DIMENSIONS}]f32`, ann: true } as const;
+
 // Vector-only namespaces: no BM25/full-text-search indexes (queries are pure ANN,
 // so FTS would just cost ingest time + storage). chunk_text/summary are large and
 // never filtered, so mark them filterable:false for the 50% storage discount.
 // Each namespace declares its own date field.
 const SCHEMA_TEXT = {
+  vector: VECTOR_FIELD,
   chunk_text: { type: "string", filterable: false },
   summary: { type: "string", filterable: false },
   bill_number_normalized: { type: "string" },
   bill_text_date: { type: "string" },
 } as const;
 const SCHEMA_AMENDMENT = {
+  vector: VECTOR_FIELD,
   chunk_text: { type: "string", filterable: false },
   summary: { type: "string", filterable: false },
   bill_number_normalized: { type: "string" },
@@ -97,12 +109,22 @@ export class TurbopufferStore implements VectorStore {
 
   async upsert(rows: VectorRow[]): Promise<void> {
     if (rows.length === 0) return;
+    const start = TPUF_DEBUG ? Date.now() : 0;
     // Turbopuffer rows are flat: id + vector + metadata attributes at the top level.
+    // Vectors go over the wire as base64 little-endian f32 (~8KB) rather than a JSON
+    // number array (~23KB) — the API accepts both and base64 is ~2.8x smaller, which
+    // dominates upsert payload size (and thus throughput when bandwidth-bound).
     await this.ns().write({
-      upsert_rows: rows.map((r) => ({ id: r.id, vector: r.vector, ...r.metadata })),
+      upsert_rows: rows.map((r) => ({ id: r.id, vector: encodeVector(r.vector), ...r.metadata })),
       distance_metric: DISTANCE_METRIC,
       schema: this.schema,
     });
+    if (TPUF_DEBUG) {
+      const ms = Date.now() - start;
+      process.stderr.write(
+        `[tpuf] write ${this.namespace} ${rows.length} rows -> ${ms}ms total (${Math.round(rows.length / (ms / 1000 || 1))}/s)\n`
+      );
+    }
   }
 
   /** Turbopuffer rows are flat — lift the non-reserved attributes into metadata. */
