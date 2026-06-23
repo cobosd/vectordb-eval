@@ -1,7 +1,8 @@
-import { createReadStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { createZstdCompress, createZstdDecompress } from "node:zlib";
 import { Prisma } from "@prisma/client";
 import { COLLECTIONS, type CollectionKey } from "../consts";
 import { prisma } from "../prisma/client";
@@ -16,12 +17,20 @@ import { createLogger, logger as rootLogger } from "../logger";
 const logger = createLogger("ingest-from-postgres");
 
 const DATA_DIR = new URL("../data/", import.meta.url);
-// Stage 1 dumps fully-assembled rows (id + vector + metadata, tagged with their
-// collection) here as JSONL; stage 2 reads them back and ingests into the stores.
-const DUMP_FILE = new URL("data-ingest-100k-bills.jsonl", DATA_DIR).pathname;
+// Shared basename for all dump artifacts (no extension).
+const DUMP_BASE = new URL("data-ingest-100k-bills", DATA_DIR).pathname;
+// Stage 1 dumps fully-assembled rows (id + vector + metadata) as one zstd-compressed
+// JSONL file per collection. Splitting per collection lets a single-collection ingest
+// open just its own file (no scanning past the other collection's rows), and zstd
+// roughly undoes the base64 vector overhead + crushes the repetitive metadata
+// (~18GB → ~11-12GB). Stage 2 streams each file back and ingests into the stores.
+const dumpFileFor = (collection: CollectionKey) => `${DUMP_BASE}.${collection}.jsonl.zst`;
+// The pre-split, uncompressed combined dump (all collections in one .jsonl). Only read
+// by `--stage=split` to convert an existing dump to the per-collection .zst format.
+const LEGACY_DUMP_FILE = `${DUMP_BASE}.jsonl`;
 // Sidecar holding per-collection row counts, so stage 2 can show progress-bar
 // totals without re-scanning the (multi-GB) dump.
-const MANIFEST_FILE = `${DUMP_FILE}.manifest.json`;
+const MANIFEST_FILE = `${DUMP_BASE}.manifest.json`;
 
 // How many distinct bills (present in bill_embedding) to select & ingest.
 const BILL_LIMIT = process.env.BILL_LIMIT ? Number(process.env.BILL_LIMIT) : 100_000;
@@ -75,16 +84,73 @@ const SERVICES: ServiceName[] | undefined = (() => {
   if (unknown.length) throw new Error(`Unknown service(s): ${unknown.join(", ")}. Valid: ${ALL_SERVICES.join(", ")}`);
   return selected.length ? selected : undefined;
 })();
-// --stage=dump | ingest | both. Default runs both (dump, then ingest); split so a
-// re-ingest can replay data-ingest-100k-bills.jsonl without re-querying Postgres.
+// --stage=dump | ingest | both | split. Default runs both (dump, then ingest); split
+// so a re-ingest can replay the dump without re-querying Postgres. `split` is a
+// one-time converter from the legacy combined .jsonl to the per-collection .zst files.
 const stageArg = process.argv.find((a) => a.startsWith("--stage="));
 const STAGE = stageArg ? stageArg.slice("--stage=".length) : "both";
-if (!["dump", "ingest", "both"].includes(STAGE)) {
-  throw new Error(`Unknown --stage="${STAGE}". Valid: dump, ingest, both`);
+if (!["dump", "ingest", "both", "split"].includes(STAGE)) {
+  throw new Error(`Unknown --stage="${STAGE}". Valid: dump, ingest, both, split`);
 }
 
 /** One assembled row as serialized to the dump file. `v` is a base64 Float32 blob. */
 type DumpRow = { collection: CollectionKey; id: string; v: string; metadata: Record<string, MetadataValue> };
+
+/** All collection keys, used to detect a row's collection cheaply from its line prefix. */
+const ALL_COLLECTIONS = Object.keys(COLLECTIONS) as CollectionKey[];
+
+/**
+ * Detect a row's collection from its line WITHOUT a full JSON.parse — `collection` is
+ * always the first key, so a prefix match suffices. Falls back to JSON.parse only if
+ * the prefix is unexpected (e.g. key order changed).
+ */
+function collectionOfLine(line: string): CollectionKey | undefined {
+  for (const c of ALL_COLLECTIONS) if (line.startsWith(`{"collection":"${c}"`)) return c;
+  try {
+    return (JSON.parse(line) as DumpRow).collection;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A streaming line-writer that zstd-compresses into a file. Respects backpressure. */
+interface LineWriter {
+  write(line: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+/** Open a zstd-compressed line-writer at `path`, creating parent dirs as needed. */
+async function openZstdWriter(path: string): Promise<LineWriter> {
+  await mkdir(dirname(path), { recursive: true });
+  const gz = createZstdCompress();
+  const out = createWriteStream(path);
+  gz.pipe(out);
+  return {
+    async write(line: string) {
+      // gz.write returns false when the internal buffer is full — wait for drain so a
+      // multi-GB stream doesn't balloon memory.
+      if (!gz.write(line)) await new Promise<void>((resolve) => gz.once("drain", () => resolve()));
+    },
+    close() {
+      return new Promise<void>((resolve, reject) => {
+        out.once("finish", () => resolve());
+        out.once("error", reject);
+        gz.once("error", reject);
+        gz.end();
+      });
+    },
+  };
+}
+
+/** Open a streaming line-reader over a zstd-compressed file. */
+function readZstdLines(path: string) {
+  return createInterface({ input: createReadStream(path).pipe(createZstdDecompress()), crlfDelay: Infinity });
+}
+
+/** Open a streaming line-reader over a plain (uncompressed) file. */
+function readPlainLines(path: string) {
+  return createInterface({ input: createReadStream(path), crlfDelay: Infinity });
+}
 
 /** Bill-level metadata (joined from the `bill` table), keyed by bill_uuid. */
 type BillMeta = Record<string, MetadataValue>;
@@ -205,17 +271,18 @@ async function stageDump(): Promise<void> {
   const billUuids = await selectBillUuids(BILL_LIMIT);
   const billMeta = await fetchBillMeta(billUuids);
 
-  await mkdir(dirname(DUMP_FILE), { recursive: true });
-  const sink = Bun.file(DUMP_FILE).writer();
-
   let written = 0;
   let missingBillMeta = 0;
-  const counts: Record<string, number> = { bill_text: 0, bill_amendment: 0 };
+  const counts: Record<string, number> = {};
 
   for (const collection of COLLECTIONS_TO_INGEST) {
     const { docType } = COLLECTIONS[collection];
     const dateField = DATE_FIELD[collection];
-    logger.info("Dumping collection", { collection, docType, bills: billUuids.length });
+    const file = dumpFileFor(collection);
+    logger.info("Dumping collection", { collection, docType, bills: billUuids.length, file });
+
+    const sink = await openZstdWriter(file);
+    counts[collection] = 0;
 
     for await (const batch of streamChunksForBills(docType, billUuids, { uuidBatchSize: UUID_BATCH_SIZE })) {
       const docUuids = [...new Set(batch.map((c) => c.doc_uuid))];
@@ -237,25 +304,82 @@ async function stageDump(): Promise<void> {
           [dateField]: dm?.date ?? "",
         };
         const row: DumpRow = { collection, id: `${c.doc_uuid}::${c.chunk_id}`, v: encodeVector(c.embedding), metadata };
-        sink.write(JSON.stringify(row) + "\n");
+        await sink.write(JSON.stringify(row) + "\n");
         written++;
         counts[collection]!++;
       }
       logger.info("Dump progress", { collection, rows: counts[collection] });
     }
+
+    await sink.close();
   }
 
-  await sink.end();
   await writeManifest(counts);
-  logger.info("Dump complete", { file: DUMP_FILE, written, counts, missingBillMeta });
+  logger.info("Dump complete", { written, counts, missingBillMeta });
+}
+
+/**
+ * One-time converter: read the legacy combined (uncompressed) dump and re-emit it as
+ * per-collection zstd files, without re-querying Postgres. Run once on an existing
+ * data-ingest-100k-bills.jsonl to migrate it to the efficient format.
+ */
+async function stageSplit(): Promise<void> {
+  if (!(await Bun.file(LEGACY_DUMP_FILE).exists())) {
+    throw new Error(`Legacy dump not found at ${LEGACY_DUMP_FILE}. Nothing to split.`);
+  }
+
+  // Use a manifest's total (if present) just to give the progress bar a total. Falls
+  // back to the legacy `<file>.jsonl.manifest.json` sidecar that older dumps wrote.
+  const legacyManifest = await Bun.file(`${LEGACY_DUMP_FILE}.manifest.json`)
+    .json()
+    .catch(() => null);
+  const total = (await readManifest())?.total ?? (legacyManifest as Manifest | null)?.total;
+  const bar = new ProgressBar("split", { total });
+
+  const writers = new Map<CollectionKey, LineWriter>();
+  const counts: Record<string, number> = {};
+  let skipped = 0;
+
+  const rl = readPlainLines(LEGACY_DUMP_FILE);
+  for await (const line of rl) {
+    if (!line) continue;
+    const collection = collectionOfLine(line);
+    if (!collection) {
+      skipped++;
+      continue;
+    }
+    let w = writers.get(collection);
+    if (!w) {
+      w = await openZstdWriter(dumpFileFor(collection));
+      writers.set(collection, w);
+    }
+    await w.write(line + "\n");
+    counts[collection] = (counts[collection] ?? 0) + 1;
+    bar.tick(1);
+  }
+  rl.close();
+  for (const w of writers.values()) await w.close();
+  bar.done();
+
+  await writeManifest(counts);
+  logger.info("Split complete", {
+    from: LEGACY_DUMP_FILE,
+    files: [...writers.keys()].map(dumpFileFor),
+    counts,
+    skipped,
+  });
 }
 
 /** Per-collection row counts persisted alongside the dump. */
 type Manifest = { counts: Record<string, number>; total: number; billLimit: number };
 
 async function writeManifest(counts: Record<string, number>): Promise<void> {
-  const total = Object.values(counts).reduce((a, b) => a + b, 0);
-  const manifest: Manifest = { counts, total, billLimit: BILL_LIMIT };
+  // Merge over any existing manifest so writing one collection (e.g. a --bill-text-only
+  // dump) doesn't drop the other collection's previously-recorded count.
+  const prev = (await readManifest())?.counts ?? {};
+  const merged = { ...prev, ...counts };
+  const total = Object.values(merged).reduce((a, b) => a + b, 0);
+  const manifest: Manifest = { counts: merged, total, billLimit: BILL_LIMIT };
   await Bun.write(MANIFEST_FILE, JSON.stringify(manifest, null, 2));
 }
 
@@ -270,31 +394,25 @@ async function readManifest(): Promise<Manifest | null> {
 }
 
 /**
- * Count rows per collection by scanning the dump. Only used as a fallback when no
- * manifest exists (e.g. a dump produced before manifests were written). Detects the
- * collection from each line's leading key to avoid a full JSON.parse per row.
+ * Count rows per collection by scanning each collection's dump file. Only used as a
+ * fallback when no manifest exists (e.g. a dump produced before manifests were written).
  */
 async function countDumpRows(): Promise<Record<string, number>> {
-  logger.info("No manifest found; counting dump rows for progress totals (one-time scan)", { file: DUMP_FILE });
-  const prefixes = COLLECTIONS_TO_INGEST.map((c) => [c, `{"collection":"${c}"`] as const);
-  const counts: Record<string, number> = Object.fromEntries(COLLECTIONS_TO_INGEST.map((c) => [c, 0]));
-  let scanned = 0;
-
-  const rl = createInterface({ input: createReadStream(DUMP_FILE), crlfDelay: Infinity });
-  for await (const line of rl) {
-    if (!line) continue;
-    let coll = prefixes.find(([, p]) => line.startsWith(p))?.[0] as string | undefined;
-    if (!coll) {
-      try {
-        coll = (JSON.parse(line) as DumpRow).collection;
-      } catch {
-        continue;
-      }
+  const counts: Record<string, number> = {};
+  for (const collection of COLLECTIONS_TO_INGEST) {
+    const file = dumpFileFor(collection);
+    if (!(await Bun.file(file).exists())) continue;
+    logger.info("No manifest found; counting dump rows for progress totals (one-time scan)", { file });
+    let n = 0;
+    const rl = readZstdLines(file);
+    for await (const line of rl) {
+      if (!line) continue;
+      n++;
+      if (n % 500_000 === 0) logger.info("Counting…", { collection, scanned: n });
     }
-    if (coll in counts) counts[coll]!++;
-    if (++scanned % 500_000 === 0) logger.info("Counting…", { scanned });
+    rl.close();
+    counts[collection] = n;
   }
-  rl.close();
   return counts;
 }
 
@@ -324,7 +442,7 @@ async function stageIngest(): Promise<void> {
     indexers.set(collection, indexer);
   }
   logger.info("Ingesting from dump", {
-    file: DUMP_FILE,
+    files: COLLECTIONS_TO_INGEST.map(dumpFileFor),
     services: indexers.get(COLLECTIONS_TO_INGEST[0]!)!.services,
     reset: RESET,
   });
@@ -361,25 +479,26 @@ async function stageIngest(): Promise<void> {
     buffers.set(collection, []);
   };
 
-  // Cheap collection detection from the line prefix (collection is always the first
-  // key), so a single-collection ingest skips the other collection's rows WITHOUT a
-  // full JSON.parse. Matters because the dump groups collections: a --bill-amendment
-  // run would otherwise parse all ~13GB of bill_text lines just to discard them.
-  const selectedPrefixes = COLLECTIONS_TO_INGEST.map((c) => `{"collection":"${c}"`);
-
+  // Each collection lives in its own file now, so a single-collection ingest opens just
+  // that file — no scanning past the other collection's rows.
   const wallStart = performance.now();
   try {
-    const rl = createInterface({ input: createReadStream(DUMP_FILE), crlfDelay: Infinity });
-    for await (const line of rl) {
-      if (!selectedPrefixes.some((p) => line.startsWith(p))) continue; // skip blanks + other collections
-      const rec = JSON.parse(line) as DumpRow;
-      const buf = buffers.get(rec.collection);
-      if (!buf) continue; // row for a collection we're not ingesting
-      buf.push({ id: rec.id, vector: decodeVector(rec.v), metadata: rec.metadata });
-      if (buf.length >= UPSERT_BATCH_SIZE) await flush(rec.collection);
+    for (const collection of COLLECTIONS_TO_INGEST) {
+      const file = dumpFileFor(collection);
+      if (!(await Bun.file(file).exists())) {
+        throw new Error(`Dump file not found: ${file}. Run --stage=dump (or --stage=split) first.`);
+      }
+      const buf = buffers.get(collection)!;
+      const rl = readZstdLines(file);
+      for await (const line of rl) {
+        if (!line) continue;
+        const rec = JSON.parse(line) as DumpRow;
+        buf.push({ id: rec.id, vector: decodeVector(rec.v), metadata: rec.metadata });
+        if (buf.length >= UPSERT_BATCH_SIZE) await flush(collection);
+      }
+      rl.close();
+      await flush(collection);
     }
-    rl.close();
-    for (const collection of COLLECTIONS_TO_INGEST) await flush(collection);
   } finally {
     for (const bar of bars.values()) bar.done();
     if (transport) transport.silent = prevSilent;
@@ -426,6 +545,7 @@ async function stageIngest(): Promise<void> {
 }
 
 async function main() {
+  if (STAGE === "split") await stageSplit();
   if (STAGE === "dump" || STAGE === "both") await stageDump();
   if (STAGE === "ingest" || STAGE === "both") await stageIngest();
   await prisma.$disconnect();
