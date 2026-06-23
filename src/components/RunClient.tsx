@@ -335,7 +335,7 @@ export function RunClient({ enabled }: { enabled: boolean }) {
               </pre>
               <p className="text-muted-foreground">
                 You can still browse saved results on the{" "}
-                <a className="underline" href="/csv">
+                <a className="underline" href="/">
                   CSV runs
                 </a>{" "}
                 page.
@@ -516,7 +516,7 @@ export function RunClient({ enabled }: { enabled: boolean }) {
                   live. Results are written to{" "}
                   <code className="rounded bg-muted px-1">evals/csv/</code> and
                   plotted on the{" "}
-                  <a className="underline" href="/csv">
+                  <a className="underline" href="/">
                     CSV runs
                   </a>{" "}
                   page.
@@ -554,7 +554,7 @@ export function RunClient({ enabled }: { enabled: boolean }) {
                         Saved{" "}
                         <code className="rounded bg-muted px-1">evals/csv/{csvFile}</code>{" "}
                         ·{" "}
-                        <a className="underline" href="/csv">
+                        <a className="underline" href="/">
                           view plots
                         </a>
                       </p>

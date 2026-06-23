@@ -24,8 +24,8 @@ import { COLLECTION_KEYS, type CollectionKey } from "../consts";
 import { embedBatch } from "../utils/embedder";
 import { createStore } from "../utils/vector-indexer";
 import { toEpoch } from "../utils/bill-metadata";
-import type { QueryFilter, ServiceName, VectorStore } from "../utils/vector-store";
-import { appendPerfRows, type PerfCsvRow } from "../utils/perf-csv";
+import type { QueryFilter, QueryPerf, ServiceName, VectorStore } from "../utils/vector-store";
+import { aggregatePerf, appendPerfRows, type PerfCsvRow } from "../utils/perf-csv";
 import { createLogger } from "../logger";
 
 const logger = createLogger("performance-filtered");
@@ -241,6 +241,8 @@ async function main() {
   const endToEnd: Record<string, number[]> = {};
   const endToEndMax: Record<string, number[]> = {};
   const hitCounts: Record<string, number> = {};
+  // service -> server-side diagnostics from the measured per-collection calls.
+  const perfByService: Record<string, QueryPerf[]> = {};
 
   const queryOpts = { topK: TOPK, consistency: CONSISTENCY, filter: FILTER, minimal: MINIMAL };
 
@@ -248,6 +250,8 @@ async function main() {
     const stores = Object.fromEntries(
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
+    const onPerf = (p: QueryPerf) => (perfByService[service] ??= []).push(p);
+    const measuredOpts = { ...queryOpts, onPerf };
 
     // Native cache prewarm (Turbopuffer) only when --warm is passed; off by default.
     if (WARM) await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
@@ -263,7 +267,7 @@ async function main() {
       for (const vector of vectors) {
         for (const collection of COLLECTION_KEYS) {
           const label = `${service}:${collection}`;
-          const [, ms] = await timeIt(() => withTimeout(label, stores[collection].query(vector, queryOpts)));
+          const [, ms] = await timeIt(() => withTimeout(label, stores[collection].query(vector, measuredOpts)));
           (perCall[`${service}:${collection}`] ??= []).push(ms);
         }
         const components: number[] = [];
@@ -300,10 +304,13 @@ async function main() {
   // Persist the per-service end-to-end stats to CSV when a caller (run.sh) sets
   // PERF_CSV. Filtered rows carry the session/date window so the dashboard can
   // distinguish them from the unfiltered rows in the same file.
-  await writeCsv(endToEnd);
+  await writeCsv(endToEnd, perfByService);
 }
 
-async function writeCsv(endToEnd: Record<string, number[]>): Promise<void> {
+async function writeCsv(
+  endToEnd: Record<string, number[]>,
+  perfByService: Record<string, QueryPerf[]>,
+): Promise<void> {
   const path = process.env.PERF_CSV;
   if (!path) return;
   const runAt = process.env.PERF_RUN_AT || new Date().toISOString();
@@ -327,6 +334,7 @@ async function writeCsv(endToEnd: Record<string, number[]>): Promise<void> {
       since: CSV_SINCE,
       until: CSV_UNTIL,
       warm: WARM,
+      ...aggregatePerf(perfByService[service] ?? []),
     };
   });
   await appendPerfRows(path, rows);

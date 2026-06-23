@@ -50,6 +50,35 @@ export type QueryOptions = {
    * fields), matching Turbopuffer's "control include_attributes" guidance.
    */
   minimal?: boolean;
+  /**
+   * Optional sink for the backend's server-side query diagnostics, called once
+   * per query when the backend reports them (Turbopuffer only today; others
+   * never call it). Lets the benchmark record cache warmth and how many
+   * unindexed docs were exhaustively scanned without changing the hit shape.
+   */
+  onPerf?: (perf: QueryPerf) => void;
+};
+
+/**
+ * Server-reported query diagnostics, normalized from a backend's native
+ * performance block. All fields optional — a backend populates only what it
+ * reports. See Turbopuffer's query `performance` object for field meanings.
+ */
+export type QueryPerf = {
+  /** Qualitative cache state for the query: "hot" | "warm" | "cold". */
+  cacheTemperature?: string;
+  /** Ratio of cache hits to total cache lookups (0–1). */
+  cacheHitRatio?: number;
+  /** Server request time incl. concurrency-limit wait (ms). */
+  serverTotalMs?: number;
+  /** Server request time excl. concurrency-limit wait (ms). */
+  queryExecutionMs?: number;
+  /** Number of unindexed documents brute-force scanned by the query. */
+  exhaustiveSearchCount?: number;
+  /** Approximate number of documents in the namespace. */
+  approxNamespaceSize?: number;
+  /** Timestamp of the last write the query observed. */
+  lastIncludedWriteAt?: string;
 };
 
 /**

@@ -4,7 +4,7 @@ import { Database, PlayCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const LINKS = [
-  { href: "/csv", label: "CSV runs", key: "csv", Icon: Database },
+  { href: "/", label: "CSV runs", key: "csv", Icon: Database },
   { href: "/run", label: "New run", key: "run", Icon: PlayCircle },
 ] as const;
 

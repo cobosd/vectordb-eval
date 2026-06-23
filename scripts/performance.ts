@@ -18,8 +18,8 @@
 import { COLLECTION_KEYS, type CollectionKey } from "../consts";
 import { embedBatch } from "../utils/embedder";
 import { createStore } from "../utils/vector-indexer";
-import type { ServiceName, VectorStore } from "../utils/vector-store";
-import { appendPerfRows, type PerfCsvRow } from "../utils/perf-csv";
+import type { QueryPerf, ServiceName, VectorStore } from "../utils/vector-store";
+import { aggregatePerf, appendPerfRows, type PerfCsvRow } from "../utils/perf-csv";
 import { createLogger } from "../logger";
 
 const logger = createLogger("performance");
@@ -223,11 +223,15 @@ async function main() {
   // End-to-end must wait for both, so it can't beat this max — comparing the two
   // shows the gap is order-statistics ("slower of two"), not Promise.all overhead.
   const endToEndMax: Record<string, number[]> = {};
+  // service -> server-side diagnostics from the measured per-collection calls.
+  const perfByService: Record<string, QueryPerf[]> = {};
 
   await Promise.all(SERVICES.map(async (service) => {
     const stores = Object.fromEntries(
       COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
+    const onPerf = (p: QueryPerf) => (perfByService[service] ??= []).push(p);
+    const measuredOpts = { ...QUERY_OPTS, onPerf };
 
     // Native cache prewarm (Turbopuffer) only when --warm is passed; off by default.
     if (WARM) await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
@@ -248,7 +252,7 @@ async function main() {
         for (const collection of COLLECTION_KEYS) {
           const label = `${service}:${collection}`;
           const [, ms] = await timeIt(() =>
-            withTimeout(label, stores[collection].query(vector, QUERY_OPTS)),
+            withTimeout(label, stores[collection].query(vector, measuredOpts)),
           );
           (perCall[`${service}:${collection}`] ??= []).push(ms);
         }
@@ -289,10 +293,13 @@ async function main() {
   // Persist the per-service end-to-end stats to CSV when a caller (run.sh) sets
   // PERF_CSV. The whole sweep accumulates into one evals/csv/<timestamp>.csv,
   // every row stamped with the shared PERF_RUN_AT so the run groups cleanly.
-  await writeCsv(endToEnd);
+  await writeCsv(endToEnd, perfByService);
 }
 
-async function writeCsv(endToEnd: Record<string, number[]>): Promise<void> {
+async function writeCsv(
+  endToEnd: Record<string, number[]>,
+  perfByService: Record<string, QueryPerf[]>,
+): Promise<void> {
   const path = process.env.PERF_CSV;
   if (!path) return;
   const runAt = process.env.PERF_RUN_AT || new Date().toISOString();
@@ -316,6 +323,7 @@ async function writeCsv(endToEnd: Record<string, number[]>): Promise<void> {
       since: "",
       until: "",
       warm: WARM,
+      ...aggregatePerf(perfByService[service] ?? []),
     };
   });
   await appendPerfRows(path, rows);

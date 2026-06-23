@@ -7,6 +7,8 @@
  * matches columns by header name, so it stays compatible regardless of order.
  */
 
+import type { QueryPerf } from "./vector-store";
+
 export const PERF_CSV_COLUMNS = [
   "run_at",
   "mode",
@@ -25,10 +27,58 @@ export const PERF_CSV_COLUMNS = [
   "since",
   "until",
   "warm",
+  // Server-side diagnostics (Turbopuffer only; blank for backends that don't
+  // report them). The reader matches by header name, so older CSVs without
+  // these columns still parse — they just read as blank.
+  "cache_temp", // coldest cache_temperature observed across the run's calls
+  "exhaustive_max", // max unindexed docs brute-force scanned in any one call
+  "server_ms_avg", // mean server_total_ms (excludes network/embedding)
 ] as const;
 
 export type PerfCsvColumn = (typeof PERF_CSV_COLUMNS)[number];
 export type PerfCsvRow = Record<PerfCsvColumn, string | number | boolean>;
+
+/** CSV-shaped summary of a service's per-call QueryPerf samples. */
+export type PerfDiagnostics = Pick<PerfCsvRow, "cache_temp" | "exhaustive_max" | "server_ms_avg">;
+
+// hot < warm < cold: report the coldest call so any cache miss is visible.
+const TEMP_RANK: Record<string, number> = { hot: 0, warm: 1, cold: 2 };
+
+/**
+ * Collapse a service's per-call diagnostics into the three CSV columns. Returns
+ * blanks when no backend reported anything (e.g. Pinecone/Qdrant/OpenSearch), so
+ * those rows leave the diagnostic columns empty rather than zeroed.
+ */
+export function aggregatePerf(samples: QueryPerf[]): PerfDiagnostics {
+  let coldest = "";
+  let coldestRank = -1;
+  let exMax = 0;
+  let hasEx = false;
+  let serverSum = 0;
+  let serverN = 0;
+  for (const s of samples) {
+    if (s.cacheTemperature) {
+      const rank = TEMP_RANK[s.cacheTemperature] ?? -1;
+      if (rank > coldestRank) {
+        coldestRank = rank;
+        coldest = s.cacheTemperature;
+      }
+    }
+    if (typeof s.exhaustiveSearchCount === "number") {
+      hasEx = true;
+      exMax = Math.max(exMax, s.exhaustiveSearchCount);
+    }
+    if (typeof s.serverTotalMs === "number") {
+      serverSum += s.serverTotalMs;
+      serverN += 1;
+    }
+  }
+  return {
+    cache_temp: coldest,
+    exhaustive_max: hasEx ? exMax : "",
+    server_ms_avg: serverN ? Math.round((serverSum / serverN) * 10) / 10 : "",
+  };
+}
 
 export function csvEscape(v: unknown): string {
   const s = String(v ?? "");
