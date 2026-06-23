@@ -20,6 +20,7 @@ import { embedBatch } from "../utils/embedder";
 import { createStore } from "../utils/vector-indexer";
 import { toEpoch } from "../utils/bill-metadata";
 import type { QueryFilter, ServiceName, VectorStore } from "../utils/vector-store";
+import { appendPerfRows, type PerfCsvRow } from "../utils/perf-csv";
 import { createLogger } from "../logger";
 
 const logger = createLogger("performance-filtered");
@@ -255,6 +256,41 @@ async function main() {
     if (endToEndMax[service]) e2eRows[`${service} max(per-collection)`] = stats(endToEndMax[service]!);
   }
   console.table(highlightedStatsTable(e2eRows, winnerKeys(e2eRows, (key) => key.includes("max(per-collection)") ? "max" : "end-to-end")));
+
+  // Persist the per-service end-to-end stats to CSV when a caller (run.sh) sets
+  // PERF_CSV. Filtered rows carry the session/date window so the dashboard can
+  // distinguish them from the unfiltered rows in the same file.
+  await writeCsv(endToEnd);
+}
+
+async function writeCsv(endToEnd: Record<string, number[]>): Promise<void> {
+  const path = process.env.PERF_CSV;
+  if (!path) return;
+  const runAt = process.env.PERF_RUN_AT || new Date().toISOString();
+  const rows: PerfCsvRow[] = SERVICES.filter((s) => endToEnd[s]?.length).map((service) => {
+    const s = stats(endToEnd[service]!);
+    return {
+      run_at: runAt,
+      mode: "filtered",
+      topK: TOPK,
+      iters: ITERATIONS,
+      service,
+      consistency: CONSISTENCY,
+      avg_ms: s["avg(ms)"],
+      p50_ms: s["p50(ms)"],
+      p95_ms: s["p95(ms)"],
+      max_ms: s["max(ms)"],
+      min_ms: s["min(ms)"],
+      calls: s.calls,
+      queries: queries.length,
+      sessions: SESSIONS.join(" "),
+      since: SINCE,
+      until: UNTIL,
+      warm: WARM,
+    };
+  });
+  await appendPerfRows(path, rows);
+  console.log(`\n→ appended ${rows.length} filtered row(s) to ${path}`);
 }
 
 main().catch((error) => {
