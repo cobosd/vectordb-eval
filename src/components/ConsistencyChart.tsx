@@ -30,8 +30,14 @@ export function ConsistencyChart({
     string,
     { config: string; eventual?: number; strong?: number }
   >();
+  const MODE_LABEL: Record<string, string> = {
+    unfiltered: "unfilt",
+    filtered: "filt",
+    "filtered-session": "filt-sess",
+    "filtered-time": "filt-time",
+  };
   for (const r of tp) {
-    const key = `${r.mode === "filtered" ? "filt" : "unfilt"}·k${r.topK}·i${r.iters}`;
+    const key = `${MODE_LABEL[r.mode] ?? r.mode}·k${r.topK}·i${r.iters}`;
     const entry = byConfig.get(key) ?? { config: key };
     if (r.consistency === "eventual") entry.eventual = r[metric];
     if (r.consistency === "strong") entry.strong = r[metric];

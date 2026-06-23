@@ -1,6 +1,9 @@
 import type { Service } from "@/lib/eval-helpers";
 
-export type RunMode = "unfiltered" | "filtered";
+// All filter modes that can appear in a CSV. The combined "filtered" is produced
+// by the dashboard orchestrator and run.sh's --filter=both; the split kinds are
+// produced by run.sh's per-predicate filtered passes (--filter=session|time).
+export type RunMode = "unfiltered" | "filtered" | "filtered-session" | "filtered-time";
 export type RunConsistency = "strong" | "eventual";
 
 /** Config sent from the UI to start a benchmark sweep. */
