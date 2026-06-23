@@ -1,19 +1,17 @@
 import Link from "next/link";
-import { BarChart3, Database, FileText, PlayCircle } from "lucide-react";
+import { Database, PlayCircle } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
 const LINKS = [
-  { href: "/", label: "Dashboard", key: "dashboard", Icon: BarChart3 },
   { href: "/csv", label: "CSV runs", key: "csv", Icon: Database },
   { href: "/run", label: "New run", key: "run", Icon: PlayCircle },
-  { href: "/notes", label: "Notes", key: "notes", Icon: FileText },
 ] as const;
 
-// The CSV-runs and New-run tabs are only useful where the runner can execute
-// (a host with vector-DB access + a writable FS). They're hidden on read-only
-// deploys like Vercel, where `runsEnabled()` is false.
-const RUN_KEYS = new Set(["csv", "run"]);
+// CSV analysis is read-only (just reads evals/csv/*.csv) so it's always shown.
+// Only the New-run tab needs a host that can execute the runner (vector-DB access +
+// writable FS), so it's hidden on read-only deploys where `runsEnabled()` is false.
+const RUN_KEYS = new Set(["run"]);
 
 export function Nav({ active, showRuns = true }: { active?: string; showRuns?: boolean }) {
   const links = showRuns ? LINKS : LINKS.filter((l) => !RUN_KEYS.has(l.key));
