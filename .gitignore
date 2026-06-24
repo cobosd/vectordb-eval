@@ -37,17 +37,10 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
-# Large source datasets & generated dumps (exceed GitHub's 100MB file limit; rebuilt
-# from Postgres via scripts/ingest-from-postgres.ts). The uncompressed dump, the
-# per-collection zstd dumps, any zipped variants, and their row-count manifests are
-# all local-only artifacts.
-data/*.jsonl
-data/*.zst
-data/*.zip
-data/*.manifest.json
-
-# Generated vector cache (id + base64 vector + metadata; rebuilt by the ingester)
-data/cache/
+# Local data dir: Postgres dumps (.jsonl/.zst/.zip), their row-count manifests,
+# and the generated vector cache — all multi-GB, local-only, rebuilt by the
+# ingester (scripts/ingest-from-postgres.ts). Never committed.
+data/
 
 # Local Qdrant Docker storage volume
 qdrant_storage/
