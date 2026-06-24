@@ -17,8 +17,12 @@ import { createLogger, logger as rootLogger } from "../logger";
 const logger = createLogger("ingest-from-postgres");
 
 const DATA_DIR = new URL("../data/", import.meta.url);
-// Shared basename for all dump artifacts (no extension).
-const DUMP_BASE = new URL("data-ingest-100k-bills", DATA_DIR).pathname;
+// Shared basename for all dump artifacts (no extension). The bill count is a
+// runtime flag (--all / BILL_LIMIT), not a property of the format, so the name
+// stays count-agnostic. Override with DUMP_BASE (absolute path, no extension) to
+// target a different file set — e.g. DUMP_BASE="$PWD/data/bills-full" yields
+// data/bills-full.<collection>.jsonl.zst.
+const DUMP_BASE = process.env.DUMP_BASE || new URL("data-ingest-bills", DATA_DIR).pathname;
 // Stage 1 dumps fully-assembled rows (id + vector + metadata) as one zstd-compressed
 // JSONL file per collection. Splitting per collection lets a single-collection ingest
 // open just its own file (no scanning past the other collection's rows), and zstd
@@ -33,7 +37,14 @@ const LEGACY_DUMP_FILE = `${DUMP_BASE}.jsonl`;
 const MANIFEST_FILE = `${DUMP_BASE}.manifest.json`;
 
 // How many distinct bills (present in bill_embedding) to select & ingest.
-const BILL_LIMIT = process.env.BILL_LIMIT ? Number(process.env.BILL_LIMIT) : 100_000;
+// --all (or BILL_LIMIT=all) selects EVERY distinct bill for full coverage —
+// no LIMIT; otherwise cap at BILL_LIMIT (default 100k). `null` means unbounded.
+const ALL_BILLS = process.argv.includes("--all") || process.env.BILL_LIMIT === "all";
+const BILL_LIMIT: number | null = ALL_BILLS
+  ? null
+  : process.env.BILL_LIMIT
+    ? Number(process.env.BILL_LIMIT)
+    : 100_000;
 // bill_uuids per chunk query (bounds the IN list and the rows held at once).
 const UUID_BATCH_SIZE = 100;
 // bill_uuids per bill-metadata query (small rows, so a larger batch is fine).
@@ -171,12 +182,13 @@ function toDateOnly(value: unknown): string {
   return iso ? iso.slice(0, 10) : "";
 }
 
-/** Select the first `limit` distinct bill_uuids present in bill_embedding. */
-async function selectBillUuids(limit: number): Promise<string[]> {
+/** Select distinct bill_uuids present in bill_embedding; `null` limit = all of them. */
+async function selectBillUuids(limit: number | null): Promise<string[]> {
+  const limitClause = limit == null ? Prisma.empty : Prisma.sql`LIMIT ${limit}`;
   const rows = await prisma.$queryRaw<{ bill_uuid: string }[]>`
-    SELECT DISTINCT bill_uuid FROM bill_embedding ORDER BY bill_uuid LIMIT ${limit}
+    SELECT DISTINCT bill_uuid FROM bill_embedding ORDER BY bill_uuid ${limitClause}
   `;
-  logger.info("Selected bills from bill_embedding", { selected: rows.length, limit });
+  logger.info("Selected bills from bill_embedding", { selected: rows.length, limit: limit ?? "all" });
   return rows.map((r) => r.bill_uuid);
 }
 
@@ -371,7 +383,7 @@ async function stageSplit(): Promise<void> {
 }
 
 /** Per-collection row counts persisted alongside the dump. */
-type Manifest = { counts: Record<string, number>; total: number; billLimit: number };
+type Manifest = { counts: Record<string, number>; total: number; billLimit: number | null };
 
 async function writeManifest(counts: Record<string, number>): Promise<void> {
   // Merge over any existing manifest so writing one collection (e.g. a --bill-text-only
