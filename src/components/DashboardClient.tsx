@@ -33,12 +33,20 @@ import {
   hasConsistencyData,
   itersIn,
   METRICS,
+  MODE_LABEL,
+  modesIn,
   rowsForConfig,
   topKsIn,
   type Consistency,
   type MetricKey,
   type Mode,
 } from "@/lib/eval-helpers";
+
+/** Read a query param on the client (returns null on the server / when absent). */
+function getParam(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get(key);
+}
 
 export function DashboardClient({
   docs,
@@ -143,11 +151,14 @@ export function DashboardClient({
 
 function Dashboard({ doc }: { doc: EvalDoc }) {
   const { rows } = doc;
+  const modes = React.useMemo(() => modesIn(rows), [rows]);
   const topKs = React.useMemo(() => topKsIn(rows), [rows]);
   const iterList = React.useMemo(() => itersIn(rows), [rows]);
   const showConsistency = React.useMemo(() => hasConsistencyData(rows), [rows]);
 
-  const [mode, setMode] = React.useState<Mode>("filtered");
+  // Deterministic defaults so server and first client render match (no window on
+  // the server). URL params are applied after mount in the effect below.
+  const [mode, setMode] = React.useState<Mode>(modes[0] ?? "unfiltered");
   const [topK, setTopK] = React.useState<number>(topKs[0] ?? 5);
   const [iters, setIters] = React.useState<number>(
     iterList[iterList.length - 1] ?? 50
@@ -161,11 +172,41 @@ function Dashboard({ doc }: { doc: EvalDoc }) {
   ]);
   const [scalingMetric, setScalingMetric] = React.useState<MetricKey>("p50");
 
+  // Apply URL params once on mount (client-only) so shared links open to the same
+  // view, clamped to values this dataset has. `synced` then gates the writer below
+  // so it can't clobber the URL with defaults before we've read it.
+  const synced = React.useRef(false);
+  React.useEffect(() => {
+    const m = getParam("mode") as Mode | null;
+    if (m && modes.includes(m)) setMode(m);
+    const k = Number(getParam("topK"));
+    if (topKs.includes(k)) setTopK(k);
+    const it = Number(getParam("iters"));
+    if (iterList.includes(it)) setIters(it);
+    const c = getParam("consistency");
+    if (c === "strong" || c === "eventual") setTpConsistency(c);
+    synced.current = true;
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // keep selections valid if the dataset changes
   React.useEffect(() => {
+    if (!modes.includes(mode)) setMode(modes[0] ?? "unfiltered");
     if (!topKs.includes(topK)) setTopK(topKs[0] ?? 5);
     if (!iterList.includes(iters)) setIters(iterList[iterList.length - 1] ?? 50);
-  }, [topKs, iterList]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [modes, topKs, iterList]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Mirror the current selection into the URL (replaceState — no navigation/scroll)
+  // so the page can be shared with its exact view, e.g. ?mode=unfiltered&consistency=strong.
+  React.useEffect(() => {
+    if (!synced.current) return;
+    const p = new URLSearchParams(window.location.search);
+    p.set("mode", mode);
+    p.set("topK", String(topK));
+    p.set("iters", String(iters));
+    if (showConsistency) p.set("consistency", tpConsistency ?? "eventual");
+    else p.delete("consistency");
+    window.history.replaceState(null, "", `${window.location.pathname}?${p.toString()}`);
+  }, [mode, topK, iters, tpConsistency, showConsistency]);
 
   const selectedRows = React.useMemo(
     () => rowsForConfig(rows, { mode, topK, iters, tpConsistency }),
@@ -210,12 +251,7 @@ function Dashboard({ doc }: { doc: EvalDoc }) {
                 <SingleToggle
                   value={mode}
                   onChange={(v) => setMode(v as Mode)}
-                  options={[
-                    { value: "unfiltered", label: "Unfiltered" },
-                    { value: "filtered", label: "Filtered" },
-                    { value: "filtered-session", label: "Filter: session" },
-                    { value: "filtered-time", label: "Filter: time" },
-                  ]}
+                  options={modes.map((m) => ({ value: m, label: MODE_LABEL[m] }))}
                 />
               </Control>
               <Control label="topK">

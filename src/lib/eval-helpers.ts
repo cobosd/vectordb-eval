@@ -50,6 +50,21 @@ export const metricChartConfig: ChartConfig = METRICS.reduce((acc, m) => {
   return acc;
 }, {} as ChartConfig);
 
+/** Canonical display order + labels for the filter modes. */
+const MODE_ORDER: Mode[] = ["unfiltered", "filtered", "filtered-session", "filtered-time"];
+export const MODE_LABEL: Record<Mode, string> = {
+  unfiltered: "Unfiltered",
+  filtered: "Filtered",
+  "filtered-session": "Filter: session",
+  "filtered-time": "Filter: time",
+};
+
+/** Modes actually present in the data, in canonical order (so empty modes never show). */
+export function modesIn(rows: EvalRow[]): Mode[] {
+  const present = new Set(rows.map((r) => r.mode));
+  return MODE_ORDER.filter((m) => present.has(m));
+}
+
 /** distinct sorted topK values present in the data */
 export function topKsIn(rows: EvalRow[]): number[] {
   return [...new Set(rows.map((r) => r.topK))].sort((a, b) => a - b);
