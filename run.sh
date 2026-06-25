@@ -47,12 +47,12 @@ echo "Writing results to $PERF_CSV"
 
 # (topK iterations) pairs to sweep.
 COMBOS=(
-  "5 5"
-  "5 50"
-  "10 5"
-  "10 50"
-  "50 5"
-  "50 50"
+  "500 5"
+  "500 50"
+  "1000 5"
+  "1000 50"
+  "2000 5"
+  "2000 50"
 )
 
 IFS=',' read -ra CONSISTENCY_LIST <<<"$CONSISTENCIES"
