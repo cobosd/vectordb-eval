@@ -11,7 +11,7 @@
  * re-runs are idempotent — a chunk overwrites its own row rather than duplicating.
  *
  * By default it skips hearings already ingested by datacore's Python backfill
- * (data/hearings-python-done.txt), so a plain run resumes the remaining ones.
+ * (ingested-data/hearings-python-done.txt), so a plain run resumes the remaining ones.
  *
  * Usage:
  *   bun scripts/ingest-hearings-turbopuffer.ts                       # remaining hearings (skips done set)
@@ -49,10 +49,10 @@ const END = flag("end"); // inclusive YYYY-MM-DD
 const LIMIT = flag("limit") ? Number(flag("limit")) : null; // cap on # of hearings
 // Path to a progress/done file (one entity_id per line) whose hearings are skipped,
 // so an already-ingested set isn't re-upserted. Defaults to the snapshot of hearings
-// the datacore Python backfill already wrote (data/hearings-python-done.txt), so a
-// plain run resumes against the existing `hearing` namespace. Pass --skip-file= (empty)
-// to ingest everything, or --skip-file=PATH for a different list.
-const DEFAULT_SKIP_FILE = new URL("../data/hearings-python-done.txt", import.meta.url).pathname;
+// the datacore Python backfill already wrote (ingested-data/hearings-python-done.txt),
+// so a plain run resumes against the existing `hearing` namespace. Pass --skip-file=
+// (empty) to ingest everything, or --skip-file=PATH for a different list.
+const DEFAULT_SKIP_FILE = new URL("../ingested-data/hearings-python-done.txt", import.meta.url).pathname;
 const SKIP_FILE = flag("skip-file", DEFAULT_SKIP_FILE) || undefined;
 const RESET = process.argv.includes("--reset");
 const DRY_RUN = process.argv.includes("--dry-run");
