@@ -10,8 +10,13 @@
  * Row id is `${entity_id}::${chunk_id}` (matching the bill ingest convention), so
  * re-runs are idempotent — a chunk overwrites its own row rather than duplicating.
  *
+ * By default it skips hearings already ingested by datacore's Python backfill
+ * (data/hearings-python-done.txt), so a plain run resumes the remaining ones.
+ *
  * Usage:
- *   bun scripts/ingest-hearings-turbopuffer.ts                       # all hearings
+ *   bun scripts/ingest-hearings-turbopuffer.ts                       # remaining hearings (skips done set)
+ *   bun scripts/ingest-hearings-turbopuffer.ts --skip-file=          # ingest everything (no skip)
+ *   bun scripts/ingest-hearings-turbopuffer.ts --skip-file=PATH      # skip a different entity_id list
  *   bun scripts/ingest-hearings-turbopuffer.ts --namespace=hearing   # target ns (default: hearing)
  *   bun scripts/ingest-hearings-turbopuffer.ts --start=2025-01-01 --end=2025-01-31
  *   bun scripts/ingest-hearings-turbopuffer.ts --limit=100           # at most N hearings
@@ -42,10 +47,13 @@ const NAMESPACE = flag("namespace", "hearing")!;
 const START = flag("start"); // inclusive YYYY-MM-DD, filters hearing.event_date
 const END = flag("end"); // inclusive YYYY-MM-DD
 const LIMIT = flag("limit") ? Number(flag("limit")) : null; // cap on # of hearings
-// Path to a progress/done file (one entity_id per line) whose hearings are skipped —
-// e.g. datacore's backfill_hearings_turbopuffer.done.txt, so an already-Python-ingested
-// set isn't re-upserted. Lets the two backfills resume against the same namespace.
-const SKIP_FILE = flag("skip-file");
+// Path to a progress/done file (one entity_id per line) whose hearings are skipped,
+// so an already-ingested set isn't re-upserted. Defaults to the snapshot of hearings
+// the datacore Python backfill already wrote (data/hearings-python-done.txt), so a
+// plain run resumes against the existing `hearing` namespace. Pass --skip-file= (empty)
+// to ingest everything, or --skip-file=PATH for a different list.
+const DEFAULT_SKIP_FILE = new URL("../data/hearings-python-done.txt", import.meta.url).pathname;
+const SKIP_FILE = flag("skip-file", DEFAULT_SKIP_FILE) || undefined;
 const RESET = process.argv.includes("--reset");
 const DRY_RUN = process.argv.includes("--dry-run");
 // Rows per Turbopuffer write(). Turbopuffer sends the whole buffer in one request
@@ -132,10 +140,15 @@ type HearingMetaRow = {
   summary: string | null;
 };
 
-/** Read a done/progress file (one entity_id per line). Empty set if no path given. */
+/** Read a done/progress file (one entity_id per line). Empty set if absent/unset. */
 async function loadSkip(): Promise<Set<string>> {
   if (!SKIP_FILE) return new Set();
-  const text = await Bun.file(SKIP_FILE).text();
+  const file = Bun.file(SKIP_FILE);
+  if (!(await file.exists())) {
+    logger.warn("Skip file not found — ingesting everything", { skipFile: SKIP_FILE });
+    return new Set();
+  }
+  const text = await file.text();
   return new Set(text.split("\n").map((l) => l.trim()).filter(Boolean));
 }
 
