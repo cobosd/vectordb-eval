@@ -71,7 +71,10 @@ const HEARING_SCHEMA = {
   state_id: { type: "uint" },
   session_id: { type: "int" },
   event_date_epoch: { type: "int" },
-  event_date: { type: "string", filterable: false },
+  // datetime (not string): Turbopuffer infers `datetime` from the ISO timestamps we
+  // send, so declaring string conflicts with an existing namespace's inferred type.
+  // datetime is also natively range-filterable.
+  event_date: { type: "datetime" },
   chamber: { type: "string" },
   hearing_type: { type: "string" },
   committee: { type: "string", filterable: false },
