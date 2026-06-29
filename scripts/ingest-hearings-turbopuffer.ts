@@ -42,6 +42,10 @@ const NAMESPACE = flag("namespace", "hearing")!;
 const START = flag("start"); // inclusive YYYY-MM-DD, filters hearing.event_date
 const END = flag("end"); // inclusive YYYY-MM-DD
 const LIMIT = flag("limit") ? Number(flag("limit")) : null; // cap on # of hearings
+// Path to a progress/done file (one entity_id per line) whose hearings are skipped —
+// e.g. datacore's backfill_hearings_turbopuffer.done.txt, so an already-Python-ingested
+// set isn't re-upserted. Lets the two backfills resume against the same namespace.
+const SKIP_FILE = flag("skip-file");
 const RESET = process.argv.includes("--reset");
 const DRY_RUN = process.argv.includes("--dry-run");
 // Rows per Turbopuffer write(). Turbopuffer sends the whole buffer in one request
@@ -128,6 +132,13 @@ type HearingMetaRow = {
   summary: string | null;
 };
 
+/** Read a done/progress file (one entity_id per line). Empty set if no path given. */
+async function loadSkip(): Promise<Set<string>> {
+  if (!SKIP_FILE) return new Set();
+  const text = await Bun.file(SKIP_FILE).text();
+  return new Set(text.split("\n").map((l) => l.trim()).filter(Boolean));
+}
+
 /**
  * Select hearing entity_ids in the (optional) date range, restricted to hearings
  * that actually have at least one chunk in hearing_embedding. Ordered for stable,
@@ -141,16 +152,21 @@ async function selectEntityIds(): Promise<string[]> {
   if (START) clauses.push(Prisma.sql`h.event_date >= ${START}::date`);
   // end is inclusive: < end + 1 day, so the whole END day is covered.
   if (END) clauses.push(Prisma.sql`h.event_date < (${END}::date + interval '1 day')`);
-  const limitClause = LIMIT != null ? Prisma.sql`LIMIT ${LIMIT}` : Prisma.empty;
 
   const rows = await prisma.$queryRaw<{ entity_id: string }[]>`
     SELECT h.entity_id
     FROM hearing h
     WHERE ${Prisma.join(clauses, " AND ")}
     ORDER BY h.entity_id
-    ${limitClause}
   `;
-  return rows.map((r) => r.entity_id);
+
+  // Skip + limit applied here (not in SQL) so --limit counts hearings actually
+  // ingested, after the already-done set is removed.
+  const skip = await loadSkip();
+  let ids = skip.size ? rows.filter((r) => !skip.has(r.entity_id)).map((r) => r.entity_id) : rows.map((r) => r.entity_id);
+  if (skip.size) logger.info("Skipping already-done hearings", { skipFile: SKIP_FILE, skipped: skip.size });
+  if (LIMIT != null) ids = ids.slice(0, LIMIT);
+  return ids;
 }
 
 /** Pre-fetch hearing-level metadata for the selected entity_ids into a map. */
