@@ -80,7 +80,10 @@ const HEARING_SCHEMA = {
   title: { type: "string", filterable: false },
   summary: { type: "string", filterable: false },
   entity_id: { type: "string" },
-  state_id: { type: "uint" },
+  // int (not uint): Turbopuffer infers signed `int` from integer values, so a uint
+  // declaration conflicts with the existing namespace's inferred type. The small
+  // positive id values fit either way.
+  state_id: { type: "int" },
   session_id: { type: "int" },
   event_date_epoch: { type: "int" },
   // datetime (not string): Turbopuffer infers `datetime` from the ISO timestamps we
