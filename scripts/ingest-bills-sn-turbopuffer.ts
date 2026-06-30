@@ -69,9 +69,11 @@ const COLLECTIONS_TO_INGEST: CollectionKey[] = (() => {
   return selected.length ? selected : ["bill_text", "bill_amendment"];
 })();
 
-// Rows per Turbopuffer write(). Turbopuffer sends the whole buffer in one request
-// (512MB / no row cap); 1000 keeps each write comfortably sized. Override to sweep.
-const UPSERT_BATCH_SIZE = process.env.UPSERT_BATCH_SIZE ? Number(process.env.UPSERT_BATCH_SIZE) : 1000;
+// Rows per Turbopuffer write(). Turbopuffer perf favors few LARGE writes — each
+// write has fixed overhead and (with FTS enabled) builds a BM25 index server-side,
+// so small batches throttle throughput. 10k rows (~a few MB after base64) stays well
+// under the 256MB request limit. Override to sweep.
+const UPSERT_BATCH_SIZE = process.env.UPSERT_BATCH_SIZE ? Number(process.env.UPSERT_BATCH_SIZE) : 10000;
 // bill_uuids per chunk query — bounds the IN list and the rows held at once.
 const UUID_BATCH_SIZE = 100;
 // bill_uuids per bill-metadata query (small rows, larger batch is fine).
@@ -294,16 +296,24 @@ async function ingestDocType(collection: CollectionKey): Promise<{ bills: number
   const meta = await fetchBillMeta(billUuids);
 
   const bar = new ProgressBar(collection, {});
-  const buffer: VectorRow[] = [];
+  let buffer: VectorRow[] = [];
   let upserted = 0;
   let missingMeta = 0;
 
+  // Pipeline writes: keep at most one TP write in flight while the next batch is
+  // read + vector-parsed, so Postgres/CPU work overlaps the network round-trip
+  // (TP serializes writes per namespace, so >1 in flight wouldn't help). Held on an
+  // object so the pending promise survives flush()'s closure reassignment.
+  const pending: { write: Promise<void> } = { write: Promise.resolve() };
   const flush = async () => {
     if (buffer.length === 0) return;
-    await upsertBatch(buffer);
-    upserted += buffer.length;
-    bar.tick(buffer.length);
-    buffer.length = 0;
+    const batch = buffer;
+    buffer = [];
+    await pending.write; // bound to one outstanding write
+    pending.write = upsertBatch(batch).then(() => {
+      upserted += batch.length;
+      bar.tick(batch.length);
+    });
   };
 
   for await (const batch of streamChunksForBills(docType, billUuids, { uuidBatchSize: UUID_BATCH_SIZE })) {
@@ -331,6 +341,7 @@ async function ingestDocType(collection: CollectionKey): Promise<{ bills: number
     }
   }
   await flush();
+  await pending.write; // drain the last write
   bar.done();
 
   logger.info("Doc type complete", { collection, namespace: NAMESPACE, bills: billUuids.length, chunks: upserted, missingMeta });
