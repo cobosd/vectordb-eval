@@ -4,19 +4,19 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { createZstdCompress, createZstdDecompress } from "node:zlib";
 import { Prisma } from "@prisma/client";
-import { COLLECTIONS, type CollectionKey } from "../consts";
-import { prisma } from "../prisma/client";
-import { streamChunksForBills } from "../utils/get-chunks";
-import { decodeVector, encodeVector } from "../utils/vector-cache";
-import { toEpoch } from "../utils/bill-metadata";
-import { ALL_SERVICES, VectorIndexer } from "../utils/vector-indexer";
-import { ProgressBar } from "../utils/progress";
-import type { MetadataValue, ServiceName, VectorRow } from "../utils/vector-store";
-import { createLogger, logger as rootLogger } from "../logger";
+import { COLLECTIONS, type CollectionKey } from "../../consts";
+import { prisma } from "../../prisma/client";
+import { streamChunksForBills } from "../../utils/get-chunks";
+import { decodeVector, encodeVector } from "../../utils/vector-cache";
+import { toEpoch } from "../../utils/bill-metadata";
+import { ALL_SERVICES, VectorIndexer } from "../../utils/vector-indexer";
+import { ProgressBar } from "../../utils/progress";
+import type { MetadataValue, ServiceName, VectorRow } from "../../utils/vector-store";
+import { createLogger, logger as rootLogger } from "../../logger";
 
 const logger = createLogger("ingest-from-postgres");
 
-const DATA_DIR = new URL("../data/", import.meta.url);
+const DATA_DIR = new URL("../../data/", import.meta.url);
 // Shared basename for all dump artifacts (no extension). The bill count is a
 // runtime flag (--all / BILL_LIMIT), not a property of the format, so the name
 // stays count-agnostic. Override with DUMP_BASE (absolute path, no extension) to

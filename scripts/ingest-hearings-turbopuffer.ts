@@ -31,7 +31,6 @@ import { prisma } from "../prisma/client";
 import { EMBEDDING_DIMENSIONS } from "../consts";
 import { getTurbopuffer } from "../services/turbopuffer/client";
 import { encodeVector } from "../utils/vector-cache";
-import { toEpoch } from "../utils/bill-metadata";
 import { ProgressBar } from "../utils/progress";
 import type { MetadataValue, VectorRow } from "../utils/vector-store";
 import { createLogger } from "../logger";
@@ -69,32 +68,32 @@ const META_BATCH_SIZE = 1000;
 // Declare `vector` so base64-encoded f32 vectors are unambiguous (see upsert).
 const VECTOR_FIELD = { type: `[${EMBEDDING_DIMENSIONS}]f32`, ann: true } as const;
 
-// Mirror the bill schema philosophy (services/turbopuffer/store.ts): declare the
-// selective filter predicates with a real numeric/string type + index, and mark the
-// big text/url columns filterable:false so Turbopuffer skips useless attribute
-// indexes (and gets the storage discount). state_id is the selective equality
-// predicate; event_date_epoch is the range predicate.
+// Per the v0 namespace mapping, the `hearing` namespace carries ONLY what prod's
+// CandidateRetriever.retrieveHearings needs: the two filter predicates (`h.state_id`
+// equality, `h.event_date` range) plus `entity_id` as the hydration key. Display
+// fields (title, committee, location, etc.) stay in Postgres and are rehydrated via
+// entity_id — they are not denormalized here.
 const HEARING_SCHEMA = {
   vector: VECTOR_FIELD,
-  chunk_text: { type: "string", filterable: false },
-  title: { type: "string", filterable: false },
-  summary: { type: "string", filterable: false },
+  // full_text_search enables a BM25 inverted index on the chunk body so we can run
+  // keyword/FTS queries (and hybrid vector+BM25) against it. filterable stays off:
+  // FTS is its own index — we never need exact equality/`filter` on this big column.
+  // english + stemming + stopword removal: match on word stems ("hearings" ~ "hearing")
+  // and drop low-signal terms so BM25 scores on the meaningful tokens.
+  content: {
+    type: "string",
+    filterable: false,
+    full_text_search: { language: "english", stemming: true, remove_stopwords: true },
+  },
   entity_id: { type: "string" },
   // int (not uint): Turbopuffer infers signed `int` from integer values, so a uint
   // declaration conflicts with the existing namespace's inferred type. The small
   // positive id values fit either way.
   state_id: { type: "int" },
-  session_id: { type: "int" },
-  event_date_epoch: { type: "int" },
   // datetime (not string): Turbopuffer infers `datetime` from the ISO timestamps we
   // send, so declaring string conflicts with an existing namespace's inferred type.
   // datetime is also natively range-filterable.
   event_date: { type: "datetime" },
-  chamber: { type: "string" },
-  hearing_type: { type: "string" },
-  committee: { type: "string", filterable: false },
-  location: { type: "string", filterable: false },
-  source_url: { type: "string", filterable: false },
 } as const;
 
 // --- helpers ---------------------------------------------------------------
@@ -116,31 +115,14 @@ function parseVector(text: string): number[] {
 }
 
 type HearingMeta = {
-  title: string;
   state_id: number;
-  session_id: number;
   event_date: string;
-  event_date_epoch: number;
-  chamber: string;
-  committee: string;
-  location: string;
-  source_url: string;
-  hearing_type: string;
-  summary: string;
 };
 
 type HearingMetaRow = {
   entity_id: string;
-  title: string | null;
   state_id: number | null;
-  session_id: number | null;
   event_date: Date | string | null;
-  chamber: string | null;
-  committee: string | null;
-  location: string | null;
-  source_url: string | null;
-  hearing_type: string | null;
-  summary: string | null;
 };
 
 /** Read a done/progress file (one entity_id per line). Empty set if absent/unset. */
@@ -193,27 +175,15 @@ async function fetchHearingMeta(entityIds: string[]): Promise<Map<string, Hearin
     if (slice.length === 0) continue;
 
     const rows = await prisma.$queryRaw<HearingMetaRow[]>`
-      SELECT entity_id, title, state_id, session_id, event_date, chamber, committee,
-             location, source_url, hearing_type::text AS hearing_type, summary
+      SELECT entity_id, state_id, event_date
       FROM hearing
       WHERE entity_id IN (${Prisma.join(slice)})
     `;
 
     for (const r of rows) {
-      const eventDate = toIsoString(r.event_date);
       map.set(r.entity_id, {
-        title: r.title ?? "",
         state_id: r.state_id ?? 0,
-        session_id: r.session_id ?? 0,
-        event_date: eventDate,
-        // Numeric epoch (ms) so backends range-filter on a real number, not a string.
-        event_date_epoch: toEpoch(eventDate),
-        chamber: r.chamber ?? "",
-        committee: r.committee ?? "",
-        location: r.location ?? "",
-        source_url: r.source_url ?? "",
-        hearing_type: r.hearing_type ?? "",
-        summary: r.summary ?? "",
+        event_date: toIsoString(r.event_date),
       });
     }
     logger.info("Fetched hearing metadata", { fetched: map.size, of: entityIds.length });
@@ -317,18 +287,9 @@ async function main() {
       const metadata: Record<string, MetadataValue> = {
         entity_id: c.entity_id,
         chunk_id: c.chunk_id,
-        chunk_text: c.content,
-        title: m?.title ?? "",
+        content: c.content,
         state_id: m?.state_id ?? 0,
-        session_id: m?.session_id ?? 0,
         event_date: m?.event_date ?? "",
-        event_date_epoch: m?.event_date_epoch ?? 0,
-        chamber: m?.chamber ?? "",
-        committee: m?.committee ?? "",
-        location: m?.location ?? "",
-        source_url: m?.source_url ?? "",
-        hearing_type: m?.hearing_type ?? "",
-        summary: m?.summary ?? "",
       };
       buffer.push({ id: `${c.entity_id}::${c.chunk_id}`, vector: c.embedding, metadata });
       if (buffer.length >= UPSERT_BATCH_SIZE) await flush();

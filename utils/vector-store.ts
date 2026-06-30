@@ -10,7 +10,7 @@
 export type ServiceName = "turbopuffer" | "pinecone" | "qdrant" | "opensearch";
 
 /** Metadata value types accepted by both Turbopuffer and Pinecone. */
-export type MetadataValue = string | number | boolean | string[];
+export type MetadataValue = string | number | boolean | string[] | number[];
 
 /** A normalized row to index into any store. */
 export type VectorRow = {
