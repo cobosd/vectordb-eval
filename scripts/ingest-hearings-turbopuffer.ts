@@ -31,6 +31,7 @@ import { prisma } from "../prisma/client";
 import { EMBEDDING_DIMENSIONS } from "../consts";
 import { getTurbopuffer } from "../services/turbopuffer/client";
 import { encodeVector } from "../utils/vector-cache";
+import { createWritePool } from "../utils/write-pool";
 import { ProgressBar } from "../utils/progress";
 import type { MetadataValue, VectorRow } from "../utils/vector-store";
 import { createLogger } from "../logger";
@@ -55,11 +56,14 @@ const DEFAULT_SKIP_FILE = new URL("../ingested-data/hearings-python-done.txt", i
 const SKIP_FILE = flag("skip-file", DEFAULT_SKIP_FILE) || undefined;
 const RESET = process.argv.includes("--reset");
 const DRY_RUN = process.argv.includes("--dry-run");
-// Rows per Turbopuffer write(). Turbopuffer perf favors few LARGE writes — each
-// write has fixed overhead and (with FTS enabled) builds a BM25 index server-side,
-// so small batches throttle throughput. 10k rows (~a few MB after base64) stays well
-// under the 256MB request limit. Override to sweep.
-const UPSERT_BATCH_SIZE = process.env.UPSERT_BATCH_SIZE ? Number(process.env.UPSERT_BATCH_SIZE) : 10000;
+// Rows per Turbopuffer write(). Batch SIZE barely affects throughput above ~1k
+// (measured); what matters is how many writes are in flight (WRITE_CONCURRENCY).
+// 2000 keeps each request small while leaving several batches in flight. Override to sweep.
+const UPSERT_BATCH_SIZE = process.env.UPSERT_BATCH_SIZE ? Number(process.env.UPSERT_BATCH_SIZE) : 2000;
+// Concurrent TP writes to the namespace. TP caps single-namespace write throughput
+// (~230 rows/s); 1 in-flight write only reaches ~half that, ~4 concurrent saturates
+// it (8+ shows no further gain). Override to tune.
+const WRITE_CONCURRENCY = process.env.WRITE_CONCURRENCY ? Number(process.env.WRITE_CONCURRENCY) : 4;
 // entity_ids per chunk query — bounds the IN list and the rows held at once.
 const ENTITY_BATCH_SIZE = 100;
 // entity_ids per hearing-metadata query (small rows, larger batch is fine).
@@ -274,20 +278,20 @@ async function main() {
   let missingMeta = 0;
   const wallStart = performance.now();
 
-  // Pipeline writes: keep at most one TP write in flight while the next batch is
-  // read + vector-parsed, so Postgres/CPU work overlaps the network round-trip
-  // (TP serializes writes per namespace, so >1 in flight wouldn't help). Held on an
-  // object so the pending promise survives flush()'s closure reassignment.
-  const pending: { write: Promise<void> } = { write: Promise.resolve() };
+  // Keep up to WRITE_CONCURRENCY writes in flight while the next batches are read +
+  // vector-parsed, so Postgres/CPU overlaps the network round-trips and several
+  // writes saturate TP's per-namespace write throughput.
+  const pool = createWritePool(WRITE_CONCURRENCY);
   const flush = async () => {
     if (buffer.length === 0) return;
     const batch = buffer;
     buffer = [];
-    await pending.write; // bound to one outstanding write
-    pending.write = upsertBatch(batch).then(() => {
-      upserted += batch.length;
-      bar.tick(batch.length);
-    });
+    await pool.submit(() =>
+      upsertBatch(batch).then(() => {
+        upserted += batch.length;
+        bar.tick(batch.length);
+      }),
+    );
   };
 
   for await (const batch of streamChunksForHearings(entityIds)) {
@@ -299,14 +303,17 @@ async function main() {
         chunk_id: c.chunk_id,
         content: c.content,
         state_id: m?.state_id ?? 0,
-        event_date: m?.event_date ?? "",
       };
+      // event_date is a TP `datetime` — an empty string fails to parse and rejects
+      // the whole write, so only set it when present (the attribute is simply absent
+      // for the rare hearing with no date).
+      if (m?.event_date) metadata.event_date = m.event_date;
       buffer.push({ id: `${c.entity_id}::${c.chunk_id}`, vector: c.embedding, metadata });
       if (buffer.length >= UPSERT_BATCH_SIZE) await flush();
     }
   }
   await flush();
-  await pending.write; // drain the last write
+  await pool.drain(); // drain outstanding writes
   bar.done();
 
   const wallMs = performance.now() - wallStart;
