@@ -35,7 +35,6 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../prisma/client";
 import { COLLECTIONS, EMBEDDING_DIMENSIONS, type CollectionKey } from "../consts";
-import { streamChunksForBills } from "../utils/get-chunks";
 import { getTurbopuffer } from "../services/turbopuffer/client";
 import { encodeVector } from "../utils/vector-cache";
 import { createWritePool } from "../utils/write-pool";
@@ -74,10 +73,15 @@ const COLLECTIONS_TO_INGEST: CollectionKey[] = (() => {
 // (measured); what matters is how many writes are in flight (WRITE_CONCURRENCY).
 // 2000 keeps each request small while leaving several batches in flight. Override to sweep.
 const UPSERT_BATCH_SIZE = process.env.UPSERT_BATCH_SIZE ? Number(process.env.UPSERT_BATCH_SIZE) : 2000;
-// Concurrent TP writes to the namespace. TP caps single-namespace write throughput
-// (~230 rows/s); 1 in-flight write only reaches ~half that, ~4 concurrent saturates
-// it (8+ shows no further gain). Override to tune.
-const WRITE_CONCURRENCY = process.env.WRITE_CONCURRENCY ? Number(process.env.WRITE_CONCURRENCY) : 4;
+// Concurrent TP writes to the namespace. On a low-latency host (in-region EC2) the
+// write rate scales well past 4; 16 is a good floor. Raise toward 24-32 if the tail
+// slows, but watch tpuf.log (TPUF_DEBUG=1) for RATE-LIMITED/429 — past that point
+// more concurrency just causes retries.
+const WRITE_CONCURRENCY = process.env.WRITE_CONCURRENCY ? Number(process.env.WRITE_CONCURRENCY) : 16;
+// Concurrent chunk-read queries (separate Prisma pool connections) feeding the write
+// pool, so Postgres reads + vector decode overlap each other and the TP writes
+// instead of running one-at-a-time. Keep ≤ the Prisma connection_limit.
+const READ_CONCURRENCY = process.env.READ_CONCURRENCY ? Number(process.env.READ_CONCURRENCY) : 4;
 // bill_uuids per chunk query — bounds the IN list and the rows held at once.
 const UUID_BATCH_SIZE = 100;
 // bill_uuids per bill-metadata query (small rows, larger batch is fine).
@@ -256,6 +260,51 @@ async function fetchBillMeta(billUuids: string[]): Promise<Map<string, BillMeta>
   return map;
 }
 
+// A chunk row. embedding comes back as a JS number[] directly: selecting
+// `embedding::real[]` (not `::text`) lets Prisma deserialize the pgvector into a
+// number[] in the query engine, skipping the per-row "[..]"->split->Number(x1536)
+// JS parse that dominated read CPU (~2.8x faster on the read path).
+type ChunkRow = {
+  bill_uuid: string;
+  doc_uuid: string;
+  chunk_id: number;
+  content: string;
+  embedding: number[];
+};
+
+/** Fetch all chunks of `docType` for a batch of bill_uuids (embedding as number[]). */
+async function fetchChunkRows(uuids: string[], docType: string): Promise<ChunkRow[]> {
+  return prisma.$queryRaw<ChunkRow[]>`
+    SELECT bill_uuid, doc_uuid, chunk_id, content, embedding::real[] AS embedding
+    FROM bill_embedding
+    WHERE doc_type = ${docType}::"BillDocumentType" AND bill_uuid IN (${Prisma.join(uuids)})
+    ORDER BY bill_uuid, doc_uuid, chunk_id
+  `;
+}
+
+/** Build a flat VectorRow from a chunk + its bill metadata. */
+function buildRow(c: ChunkRow, docType: string, m: BillMeta | undefined): VectorRow {
+  const metadata: Record<string, MetadataValue> = {
+    bill_uuid: c.bill_uuid,
+    doc_uuid: c.doc_uuid,
+    doc_type: docType,
+    chunk_id: c.chunk_id,
+    content: c.content,
+    state_id: m?.state_id ?? 0,
+    status_id: m?.status_id ?? 0,
+    session_id: m?.session_id ?? 0,
+    committee_id: m?.committee_id ?? 0,
+    current_body_id: m?.current_body_id ?? 0,
+    is_failed: m?.is_failed ?? false,
+    is_vetoed: m?.is_vetoed ?? false,
+    has_dead_progress_status: m?.has_dead_progress_status ?? false,
+  };
+  // notification_action_time is a TP `datetime` — an empty string fails to parse
+  // and rejects the whole write, so only set it when present.
+  if (m?.notification_action_time) metadata.notification_action_time = m.notification_action_time;
+  return { id: `${c.doc_uuid}::${c.chunk_id}`, vector: c.embedding, metadata };
+}
+
 // --- main ------------------------------------------------------------------
 
 async function upsertBatch(rows: VectorRow[]): Promise<void> {
@@ -300,54 +349,42 @@ async function ingestDocType(collection: CollectionKey): Promise<{ bills: number
   const meta = await fetchBillMeta(billUuids);
 
   const bar = new ProgressBar(collection, {});
-  let buffer: VectorRow[] = [];
   let upserted = 0;
   let missingMeta = 0;
 
-  // Keep up to WRITE_CONCURRENCY writes in flight while the next batches are read +
-  // vector-parsed, so Postgres/CPU overlaps the network round-trips and several
-  // writes saturate TP's per-namespace write throughput.
-  const pool = createWritePool(WRITE_CONCURRENCY);
-  const flush = async () => {
-    if (buffer.length === 0) return;
-    const batch = buffer;
-    buffer = [];
-    await pool.submit(() =>
-      upsertBatch(batch).then(() => {
-        upserted += batch.length;
-        bar.tick(batch.length);
-      }),
-    );
+  // Two pools, decoupled: READ_CONCURRENCY chunk queries run concurrently on
+  // separate Prisma connections, and each feeds the WRITE_CONCURRENCY-bounded TP
+  // write pool. A read task holds its read slot until its writes are submitted, so
+  // reads naturally backpressure (and memory stays bounded) when writes fall behind.
+  const readPool = createWritePool(READ_CONCURRENCY);
+  const writePool = createWritePool(WRITE_CONCURRENCY);
+
+  const submitWrites = async (rows: VectorRow[]) => {
+    for (let i = 0; i < rows.length; i += UPSERT_BATCH_SIZE) {
+      const batch = rows.slice(i, i + UPSERT_BATCH_SIZE);
+      await writePool.submit(() =>
+        upsertBatch(batch).then(() => {
+          upserted += batch.length;
+          bar.tick(batch.length);
+        }),
+      );
+    }
   };
 
-  for await (const batch of streamChunksForBills(docType, billUuids, { uuidBatchSize: UUID_BATCH_SIZE })) {
-    for (const c of batch) {
-      const m = meta.get(c.bill_uuid);
-      if (!m) missingMeta++;
-      const metadata: Record<string, MetadataValue> = {
-        bill_uuid: c.bill_uuid,
-        doc_uuid: c.doc_uuid,
-        doc_type: docType,
-        chunk_id: c.chunk_id,
-        content: c.content,
-        state_id: m?.state_id ?? 0,
-        status_id: m?.status_id ?? 0,
-        session_id: m?.session_id ?? 0,
-        committee_id: m?.committee_id ?? 0,
-        current_body_id: m?.current_body_id ?? 0,
-        is_failed: m?.is_failed ?? false,
-        is_vetoed: m?.is_vetoed ?? false,
-        has_dead_progress_status: m?.has_dead_progress_status ?? false,
-      };
-      // notification_action_time is a TP `datetime` — an empty string fails to parse
-      // and rejects the whole write, so only set it when present.
-      if (m?.notification_action_time) metadata.notification_action_time = m.notification_action_time;
-      buffer.push({ id: `${c.doc_uuid}::${c.chunk_id}`, vector: c.embedding, metadata });
-      if (buffer.length >= UPSERT_BATCH_SIZE) await flush();
-    }
+  for (let i = 0; i < billUuids.length; i += UUID_BATCH_SIZE) {
+    const group = billUuids.slice(i, i + UUID_BATCH_SIZE);
+    await readPool.submit(async () => {
+      const chunks = await fetchChunkRows(group, docType);
+      const rows = chunks.map((c) => {
+        const m = meta.get(c.bill_uuid);
+        if (!m) missingMeta++;
+        return buildRow(c, docType, m);
+      });
+      await submitWrites(rows);
+    });
   }
-  await flush();
-  await pool.drain(); // drain outstanding writes
+  await readPool.drain(); // all reads done + their writes submitted
+  await writePool.drain(); // drain outstanding writes
   bar.done();
 
   logger.info("Doc type complete", { collection, namespace: NAMESPACE, bills: billUuids.length, chunks: upserted, missingMeta });
