@@ -102,11 +102,13 @@ export const TURBOPUFFER_SCHEMAS = {
 export class TurbopufferStore implements VectorStore {
   readonly service = "turbopuffer" as const;
   private readonly namespace: string;
-  private readonly schema: (typeof TURBOPUFFER_SCHEMAS)[CollectionKey];
+  // Undefined for the single-namespace `bill` collection: it's a query-only
+  // benchmark target here; its writes go through ingest-bills-sn-turbopuffer.ts.
+  private readonly schema: (typeof TURBOPUFFER_SCHEMAS)[keyof typeof TURBOPUFFER_SCHEMAS] | undefined;
 
   constructor(collection: CollectionKey) {
     this.namespace = COLLECTIONS[collection].turbopufferNamespace;
-    this.schema = TURBOPUFFER_SCHEMAS[collection];
+    this.schema = (TURBOPUFFER_SCHEMAS as Record<string, typeof SCHEMA_TEXT | typeof SCHEMA_AMENDMENT>)[collection];
   }
 
   private ns() {
@@ -131,6 +133,12 @@ export class TurbopufferStore implements VectorStore {
 
   async upsert(rows: VectorRow[]): Promise<void> {
     if (rows.length === 0) return;
+    if (!this.schema) {
+      throw new Error(
+        `No Turbopuffer schema for namespace "${this.namespace}" — this collection is query-only here; ` +
+          `ingest it via ingest-bills-sn-turbopuffer.ts`,
+      );
+    }
     const start = TPUF_DEBUG ? Date.now() : 0;
     // Turbopuffer rows are flat: id + vector + metadata attributes at the top level.
     // Vectors go over the wire as base64 little-endian f32 (~8KB) rather than a JSON

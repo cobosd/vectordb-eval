@@ -20,7 +20,7 @@
  *   bun scripts/performance-filtered.ts --minimal --filter=time
  */
 
-import { COLLECTION_KEYS, type CollectionKey } from "../consts";
+import { COLLECTION_KEYS, COLLECTIONS, type CollectionKey } from "../consts";
 import { embedBatch } from "../utils/embedder";
 import { createStore } from "../utils/vector-indexer";
 import { toEpoch } from "../utils/bill-metadata";
@@ -44,7 +44,7 @@ const flag = (name: string, fallback: string): string => {
   return found ? found.slice(name.length + 3) : fallback;
 };
 
-const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "filter", "session", "sessions", "since", "until", "warm", "minimal"]);
+const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "filter", "session", "sessions", "since", "until", "warm", "minimal", "collections"]);
 const unknown = args
   .filter((a) => a.startsWith("--"))
   .map((a) => a.slice(2).split("=")[0]!)
@@ -88,6 +88,20 @@ if (SESSIONS.length === 0) {
 const SINCE = flag("since", "2026-06-10");
 const UNTIL = flag("until", ""); // optional upper bound; empty = open-ended (since-only)
 
+// --collections=bill (or a CSV) restricts the sweep to specific collections.
+// Defaults to the two-namespace set (bill_text, bill_amendment).
+const COLLECTIONS_TO_RUN: CollectionKey[] = (() => {
+  const raw = flag("collections", "");
+  if (!raw) return COLLECTION_KEYS;
+  const requested = raw.split(",").map((c) => c.trim()).filter(Boolean);
+  const bad = requested.filter((c) => !(c in COLLECTIONS));
+  if (bad.length) {
+    console.error(`Unknown collection(s): ${bad.join(", ")}. Known: ${Object.keys(COLLECTIONS).join(", ")}`);
+    process.exit(1);
+  }
+  return requested as CollectionKey[];
+})();
+
 const SINCE_EPOCH = toEpoch(SINCE);
 if (SINCE_EPOCH === 0) {
   console.error(`Invalid --since date: "${SINCE}" (expected an ISO date like 2026-06-10).`);
@@ -102,27 +116,48 @@ if (UNTIL_EPOCH && UNTIL_EPOCH <= SINCE_EPOCH) {
   console.error(`--until (${UNTIL}) must be after --since (${SINCE}).`);
   process.exit(1);
 }
+// RFC3339 form of the same bounds, for collections that store the date as a native
+// Turbopuffer `datetime` rather than a numeric epoch (see TIME field selection below).
+const SINCE_ISO = new Date(SINCE_EPOCH).toISOString();
+const UNTIL_ISO = UNTIL_EPOCH ? new Date(UNTIL_EPOCH).toISOString() : "";
 
-// Numeric clauses both backends run identically. --filter picks which apply:
-//   session → session_id eq/in only
-//   time    → notification_action_time_epoch range only (lower bound, +upper if --until)
-//   both    → both, ANDed (the original combined filter)
+// The single-namespace `bill` collection carries the date as a native `datetime`
+// attribute (`notification_action_time`) and has NO `..._epoch` column, so it must
+// be range-filtered with RFC3339 strings. The two-namespace collections carry the
+// numeric epoch. Both express the same window; only the field + value type differ.
+const DATETIME_COLLECTIONS = new Set<CollectionKey>(["bill"]);
+
 const SESSION_CLAUSE: QueryFilter[number] =
   SESSIONS.length === 1
     ? { field: "session_id", op: "eq", value: SESSIONS[0]! }
     : { field: "session_id", op: "in", value: SESSIONS };
-const TIME_CLAUSES: QueryFilter = [
-  { field: "notification_action_time_epoch", op: "gte", value: SINCE_EPOCH },
-  ...(UNTIL_EPOCH
-    ? [{ field: "notification_action_time_epoch", op: "lte", value: UNTIL_EPOCH } satisfies QueryFilter[number]]
-    : []),
-];
-const FILTER: QueryFilter =
-  FILTER_KIND === "session"
+
+function timeClausesFor(collection: CollectionKey): QueryFilter {
+  if (DATETIME_COLLECTIONS.has(collection)) {
+    return [
+      { field: "notification_action_time", op: "gte", value: SINCE_ISO },
+      ...(UNTIL_ISO ? [{ field: "notification_action_time", op: "lte", value: UNTIL_ISO } satisfies QueryFilter[number]] : []),
+    ];
+  }
+  return [
+    { field: "notification_action_time_epoch", op: "gte", value: SINCE_EPOCH },
+    ...(UNTIL_EPOCH ? [{ field: "notification_action_time_epoch", op: "lte", value: UNTIL_EPOCH } satisfies QueryFilter[number]] : []),
+  ];
+}
+
+// Per-collection filter (both backends run the identical clause for a given
+// collection). --filter picks which predicates apply:
+//   session → session_id eq/in only
+//   time    → notification_action_time range only (lower bound, +upper if --until)
+//   both    → both, ANDed
+function filterFor(collection: CollectionKey): QueryFilter {
+  const time = timeClausesFor(collection);
+  return FILTER_KIND === "session"
     ? [SESSION_CLAUSE]
     : FILTER_KIND === "time"
-      ? TIME_CLAUSES
-      : [SESSION_CLAUSE, ...TIME_CLAUSES];
+      ? time
+      : [SESSION_CLAUSE, ...time];
+}
 
 // CSV identity + provenance for this filter kind. `both` keeps the legacy
 // "filtered" mode; the split kinds get their own mode so dashboard rows don't
@@ -225,16 +260,22 @@ async function main() {
   const [vectors, embedMs] = await timeIt(() => embedBatch(queries));
   const sessionClause =
     SESSIONS.length === 1 ? `session_id == ${SESSIONS[0]}` : `session_id IN [${SESSIONS.join(", ")}]`;
-  const dateClause = UNTIL_EPOCH
-    ? `${SINCE_EPOCH} (${SINCE}) <= notification_action_time_epoch <= ${UNTIL_EPOCH} (${UNTIL})`
-    : `notification_action_time_epoch >= ${SINCE_EPOCH} (${SINCE})`;
+  // Date field/value type varies by collection (epoch vs datetime); show the window
+  // by human date and note the collections that use the native datetime attribute.
+  const dateClause = UNTIL
+    ? `${SINCE} <= notification_action_time <= ${UNTIL}`
+    : `notification_action_time >= ${SINCE}`;
   const filterDesc =
     FILTER_KIND === "session" ? sessionClause
     : FILTER_KIND === "time" ? dateClause
     : `${sessionClause} AND ${dateClause}`;
+  const dtNote = COLLECTIONS_TO_RUN.some((c) => DATETIME_COLLECTIONS.has(c))
+    ? ` (datetime filter for: ${COLLECTIONS_TO_RUN.filter((c) => DATETIME_COLLECTIONS.has(c)).join(", ")})`
+    : "";
   console.log(
     `\nEmbedded ${queries.length} queries in ${round(embedMs)}ms. ` +
-      `Filter [${FILTER_KIND}]${MINIMAL ? " (minimal: id-only)" : ""}: ${filterDesc}\n`,
+      `Collections: ${COLLECTIONS_TO_RUN.join(", ")}. ` +
+      `Filter [${FILTER_KIND}]${MINIMAL ? " (minimal: id-only)" : ""}: ${filterDesc}${dtNote}\n`,
   );
 
   const perCall: Record<string, number[]> = {};
@@ -244,20 +285,22 @@ async function main() {
   // service -> server-side diagnostics from the measured per-collection calls.
   const perfByService: Record<string, QueryPerf[]> = {};
 
-  const queryOpts = { topK: TOPK, consistency: CONSISTENCY, filter: FILTER, minimal: MINIMAL };
+  // Base opts shared by every call; the metadata filter is added per-collection
+  // (the date predicate's field/value type differs between collections).
+  const baseOpts = { topK: TOPK, consistency: CONSISTENCY, minimal: MINIMAL };
+  const optsFor = (collection: CollectionKey) => ({ ...baseOpts, filter: filterFor(collection) });
 
   await Promise.all(SERVICES.map(async (service) => {
     const stores = Object.fromEntries(
-      COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
+      COLLECTIONS_TO_RUN.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
     const onPerf = (p: QueryPerf) => (perfByService[service] ??= []).push(p);
-    const measuredOpts = { ...queryOpts, onPerf };
 
     // Native cache prewarm (Turbopuffer) only when --warm is passed; off by default.
-    if (WARM) await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
+    if (WARM) await Promise.all(COLLECTIONS_TO_RUN.map((c) => stores[c].warm?.().catch(() => {})));
     await Promise.all(
-      COLLECTION_KEYS.map((c) =>
-        withTimeout(`${service}:${c} warmup`, stores[c].query(vectors[0]!, queryOpts))
+      COLLECTIONS_TO_RUN.map((c) =>
+        withTimeout(`${service}:${c} warmup`, stores[c].query(vectors[0]!, optsFor(c)))
           .then((hits) => (hitCounts[`${service}:${c}`] = hits.length))
           .catch(() => []),
       ),
@@ -265,17 +308,17 @@ async function main() {
 
     for (let iter = 0; iter < ITERATIONS; iter++) {
       for (const vector of vectors) {
-        for (const collection of COLLECTION_KEYS) {
+        for (const collection of COLLECTIONS_TO_RUN) {
           const label = `${service}:${collection}`;
-          const [, ms] = await timeIt(() => withTimeout(label, stores[collection].query(vector, measuredOpts)));
+          const [, ms] = await timeIt(() => withTimeout(label, stores[collection].query(vector, { ...optsFor(collection), onPerf })));
           (perCall[`${service}:${collection}`] ??= []).push(ms);
         }
         const components: number[] = [];
         const [, combined] = await timeIt(() =>
           Promise.all(
-            COLLECTION_KEYS.map(async (collection) => {
+            COLLECTIONS_TO_RUN.map(async (collection) => {
               const label = `${service}:${collection} parallel`;
-              const [, ms] = await timeIt(() => withTimeout(label, stores[collection].query(vector, queryOpts)));
+              const [, ms] = await timeIt(() => withTimeout(label, stores[collection].query(vector, optsFor(collection))));
               components.push(ms);
             }),
           ),

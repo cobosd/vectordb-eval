@@ -15,7 +15,7 @@
  *   bun scripts/performance.ts --minimal                  # return ids only (no metadata payload)
  */
 
-import { COLLECTION_KEYS, type CollectionKey } from "../consts";
+import { COLLECTION_KEYS, COLLECTIONS, type CollectionKey } from "../consts";
 import { embedBatch } from "../utils/embedder";
 import { createStore } from "../utils/vector-indexer";
 import type { QueryPerf, ServiceName, VectorStore } from "../utils/vector-store";
@@ -40,7 +40,7 @@ const flag = (name: string, fallback: string): string => {
 
 // Reject unknown flags so typos / unimplemented options fail loudly instead of
 // being silently ignored.
-const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "query", "warm", "minimal"]);
+const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "query", "warm", "minimal", "collections"]);
 const unknown = args
   .filter((a) => a.startsWith("--"))
   .map((a) => a.slice(2).split("=")[0]!)
@@ -70,6 +70,23 @@ const WARM = args.includes("--warm");
 // from response-payload cost. Shared by every query() call below.
 const MINIMAL = args.includes("--minimal");
 const QUERY_OPTS = { topK: TOPK, consistency: CONSISTENCY, minimal: MINIMAL };
+
+// --collections=bill (or a CSV) restricts the sweep to specific collections.
+// Defaults to the two-namespace set (bill_text, bill_amendment). `bill` targets
+// the single-namespace variant — pair it with --services=turbopuffer.
+const COLLECTIONS_TO_RUN: CollectionKey[] = (() => {
+  const raw = flag("collections", "");
+  if (!raw) return COLLECTION_KEYS;
+  const requested = raw.split(",").map((c) => c.trim()).filter(Boolean);
+  const bad = requested.filter((c) => !(c in COLLECTIONS));
+  if (bad.length) {
+    console.error(
+      `Unknown collection(s): ${bad.join(", ")}. Known: ${Object.keys(COLLECTIONS).join(", ")}`,
+    );
+    process.exit(1);
+  }
+  return requested as CollectionKey[];
+})();
 
 async function timeIt<T>(fn: () => Promise<T>): Promise<[T, number]> {
   const start = performance.now();
@@ -168,14 +185,14 @@ async function oneShot(): Promise<void> {
   const rows: Record<string, { "latency(ms)": number; hits: number; "top score": number }> = {};
   for (const service of SERVICES) {
     const stores = Object.fromEntries(
-      COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
+      COLLECTIONS_TO_RUN.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
     if (WARM) {
       logger.info("Warming", { service });
-      await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch((e) => logger.warn("warm failed", { service, collection: c, error: String(e) }))));
+      await Promise.all(COLLECTIONS_TO_RUN.map((c) => stores[c].warm?.().catch((e) => logger.warn("warm failed", { service, collection: c, error: String(e) }))));
     }
 
-    for (const collection of COLLECTION_KEYS) {
+    for (const collection of COLLECTIONS_TO_RUN) {
       const label = `${service}:${collection}`;
       logger.info("Querying", { label });
       try {
@@ -228,17 +245,17 @@ async function main() {
 
   await Promise.all(SERVICES.map(async (service) => {
     const stores = Object.fromEntries(
-      COLLECTION_KEYS.map((c) => [c, createStore(service, c)]),
+      COLLECTIONS_TO_RUN.map((c) => [c, createStore(service, c)]),
     ) as Record<CollectionKey, VectorStore>;
     const onPerf = (p: QueryPerf) => (perfByService[service] ??= []).push(p);
     const measuredOpts = { ...QUERY_OPTS, onPerf };
 
     // Native cache prewarm (Turbopuffer) only when --warm is passed; off by default.
-    if (WARM) await Promise.all(COLLECTION_KEYS.map((c) => stores[c].warm?.().catch(() => {})));
+    if (WARM) await Promise.all(COLLECTIONS_TO_RUN.map((c) => stores[c].warm?.().catch(() => {})));
     // Always prime the HTTP connection with a throwaway query (not measured) so the
     // first measured call doesn't pay TLS/connection setup.
     await Promise.all(
-      COLLECTION_KEYS.map((c) =>
+      COLLECTIONS_TO_RUN.map((c) =>
         withTimeout(
           `${service}:${c} warmup`,
           stores[c].query(vectors[0]!, QUERY_OPTS),
@@ -249,7 +266,7 @@ async function main() {
     for (let iter = 0; iter < ITERATIONS; iter++) {
       for (const vector of vectors) {
         // Isolated per-collection timing (sequential).
-        for (const collection of COLLECTION_KEYS) {
+        for (const collection of COLLECTIONS_TO_RUN) {
           const label = `${service}:${collection}`;
           const [, ms] = await timeIt(() =>
             withTimeout(label, stores[collection].query(vector, measuredOpts)),
@@ -263,7 +280,7 @@ async function main() {
         const components: number[] = [];
         const [, combined] = await timeIt(() =>
           Promise.all(
-            COLLECTION_KEYS.map(async (collection) => {
+            COLLECTIONS_TO_RUN.map(async (collection) => {
               const label = `${service}:${collection} parallel`;
               const [, ms] = await timeIt(() =>
                 withTimeout(label, stores[collection].query(vector, QUERY_OPTS)),

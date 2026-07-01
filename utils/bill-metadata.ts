@@ -3,8 +3,11 @@ import type { MetadataValue } from "./vector-store";
 
 export type BillMeta = Record<string, MetadataValue>;
 
-/** The per-collection date field name carried in metadata. */
-const DATE_FIELD: Record<CollectionKey, string> = {
+/**
+ * The per-collection date field name carried in metadata. Only the two-namespace
+ * collections have one; the single-namespace `bill` (ingested elsewhere) is absent.
+ */
+const DATE_FIELD: Partial<Record<CollectionKey, string>> = {
   bill_text: "bill_text_date",
   bill_amendment: "amendment_date",
 };
@@ -36,6 +39,6 @@ export function buildBillMetadata(record: Record<string, any>, collection: Colle
     hide: record.hide ?? false,
     s3_url: record.s3_url ?? "",
     summary: record.summary ?? "",
-    [dateField]: record[dateField] ?? "",
+    ...(dateField ? { [dateField]: record[dateField] ?? "" } : {}),
   };
 }
