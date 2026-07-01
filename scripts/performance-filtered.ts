@@ -17,15 +17,15 @@
  *   bun scripts/performance-filtered.ts --filter=session
  *   bun scripts/performance-filtered.ts --filter=time --since=2026-06-10
  *   # return ids only (no metadata) to isolate search latency from payload cost:
- *   bun scripts/performance-filtered.ts --minimal --filter=time
+ *   bun scripts/performance-filtered.ts --attribute-payload=minimal --filter=time  # minimal|decent|full
  */
 
 import { COLLECTION_KEYS, COLLECTIONS, type CollectionKey } from "../consts";
 import { embedBatch } from "../utils/embedder";
 import { createStore } from "../utils/vector-indexer";
 import { toEpoch } from "../utils/bill-metadata";
-import type { QueryFilter, QueryPerf, ServiceName, VectorStore } from "../utils/vector-store";
-import { aggregatePerf, appendPerfRows, type PerfCsvRow } from "../utils/perf-csv";
+import type { AttributePayload, QueryFilter, QueryPerf, ServiceName, VectorStore } from "../utils/vector-store";
+import { aggregatePerf, appendPerfRows, printDiagnostics, type PerfCsvRow } from "../utils/perf-csv";
 import { createLogger } from "../logger";
 
 const logger = createLogger("performance-filtered");
@@ -44,7 +44,7 @@ const flag = (name: string, fallback: string): string => {
   return found ? found.slice(name.length + 3) : fallback;
 };
 
-const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "filter", "session", "sessions", "since", "until", "warm", "minimal", "collections"]);
+const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "filter", "session", "sessions", "since", "until", "warm", "attribute-payload", "collections"]);
 const unknown = args
   .filter((a) => a.startsWith("--"))
   .map((a) => a.slice(2).split("=")[0]!)
@@ -71,9 +71,13 @@ if (!["session", "time", "both"].includes(FILTER_KIND)) {
 }
 // Native cache prewarm (Turbopuffer) is off by default; --warm enables it.
 const WARM = args.includes("--warm");
-// --minimal: return only document ids (no metadata) to isolate search latency
-// from response-payload cost.
-const MINIMAL = args.includes("--minimal");
+// --attribute-payload=minimal|decent|full (default full): how much per-hit payload
+// to return, to weigh search latency against response-payload cost.
+const PAYLOAD = flag("attribute-payload", "full") as AttributePayload;
+if (!["minimal", "decent", "full"].includes(PAYLOAD)) {
+  console.error(`Invalid --attribute-payload: "${PAYLOAD}". Expected one of: minimal, decent, full.`);
+  process.exit(1);
+}
 
 // --sessions=2176,2244 (preferred) or --session=2176 (single, back-compat).
 const SESSIONS = flag("sessions", flag("session", "2163"))
@@ -275,7 +279,7 @@ async function main() {
   console.log(
     `\nEmbedded ${queries.length} queries in ${round(embedMs)}ms. ` +
       `Collections: ${COLLECTIONS_TO_RUN.join(", ")}. ` +
-      `Filter [${FILTER_KIND}]${MINIMAL ? " (minimal: id-only)" : ""}: ${filterDesc}${dtNote}\n`,
+      `Filter [${FILTER_KIND}]${PAYLOAD !== "full" ? ` (payload: ${PAYLOAD})` : ""}: ${filterDesc}${dtNote}\n`,
   );
 
   const perCall: Record<string, number[]> = {};
@@ -287,7 +291,7 @@ async function main() {
 
   // Base opts shared by every call; the metadata filter is added per-collection
   // (the date predicate's field/value type differs between collections).
-  const baseOpts = { topK: TOPK, consistency: CONSISTENCY, minimal: MINIMAL };
+  const baseOpts = { topK: TOPK, consistency: CONSISTENCY, attributePayload: PAYLOAD };
   const optsFor = (collection: CollectionKey) => ({ ...baseOpts, filter: filterFor(collection) });
 
   await Promise.all(SERVICES.map(async (service) => {
@@ -343,6 +347,8 @@ async function main() {
     if (endToEndMax[service]) e2eRows[`${service} max(per-collection)`] = stats(endToEndMax[service]!);
   }
   console.table(highlightedStatsTable(e2eRows, winnerKeys(e2eRows, (key) => key.includes("max(per-collection)") ? "max" : "end-to-end")));
+
+  printDiagnostics(perfByService);
 
   // Persist the per-service end-to-end stats to CSV when a caller (run.sh) sets
   // PERF_CSV. Filtered rows carry the session/date window so the dashboard can

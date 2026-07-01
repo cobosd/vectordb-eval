@@ -16,6 +16,7 @@ import type {
   VectorRow,
   VectorStore,
 } from "../../utils/vector-store";
+import { DECENT_ATTRIBUTES } from "../../utils/vector-store";
 import { createLogger } from "../../logger";
 import { encodeVector } from "../../utils/vector-cache";
 import { getTurbopuffer } from "./client";
@@ -167,15 +168,23 @@ export class TurbopufferStore implements VectorStore {
   }
 
   async query(vector: number[], options: QueryOptions = {}): Promise<QueryHit[]> {
-    const { topK = 10, consistency = "eventual", filter, minimal, onPerf } = options;
+    const { topK = 10, consistency = "eventual", filter, attributePayload = "full", onPerf } = options;
+    // Attribute payload level → what comes back per hit (id + $dist always do):
+    //   minimal — include_attributes:false (nothing else)
+    //   decent  — only the small DECENT_ATTRIBUTES subset
+    //   full    — all attributes EXCEPT the raw vector (exclude "vector" rather than
+    //             include_attributes:true, which also ships the 1536-dim vector,
+    //             ~6KB/row, and would dominate the payload)
+    const attributeSelection =
+      attributePayload === "minimal"
+        ? { include_attributes: false }
+        : attributePayload === "decent"
+          ? { include_attributes: [...DECENT_ATTRIBUTES] }
+          : { exclude_attributes: ["vector"] };
     const result = await this.ns().query({
       rank_by: ["vector", "ANN", vector],
       limit: topK,
-      // minimal: return nothing but id + $dist. Otherwise all metadata EXCEPT the
-      // raw vector — exclude "vector" rather than include_attributes:true, since
-      // true also returns the 1536-dim vector per hit (~20KB/row) and dominates
-      // the response payload.
-      ...(minimal ? { include_attributes: false } : { exclude_attributes: ["vector"] }),
+      ...attributeSelection,
       // Eventual by default: skips strong consistency's object-storage round-trip
       // and matches Pinecone serverless (also eventual).
       consistency: { level: consistency },

@@ -152,12 +152,14 @@ export class PineconeStore implements VectorStore {
   }
 
   async query(vector: number[], options: QueryOptions = {}): Promise<QueryHit[]> {
-    const { topK = 10, filter, minimal } = options;
+    const { topK = 10, filter, attributePayload = "full" } = options;
     // Default namespace — matches how upsert() writes (no namespace override).
+    // Pinecone can't select individual metadata fields at query time, so "decent"
+    // degrades to "full" (all metadata); only "minimal" drops metadata entirely.
     const res = await getPinecone().index(this.indexName).query({
       vector,
       topK,
-      includeMetadata: !minimal, // minimal: id + score only
+      includeMetadata: attributePayload !== "minimal", // minimal: id + score only
       includeValues: false, // never ship the raw vector back — inflates payload, esp. at high topK
       ...(filter ? { filter: toPineconeFilter(filter) } : {}),
     });

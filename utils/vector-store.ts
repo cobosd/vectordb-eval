@@ -33,6 +33,18 @@ export type FilterCondition = {
 export type QueryFilter = FilterCondition[];
 
 /** Options for a nearest-neighbor query. */
+/** How much per-hit attribute payload a query returns. See QueryOptions.attributePayload. */
+export type AttributePayload = "minimal" | "decent" | "full";
+
+/**
+ * The extra attributes returned at the "decent" payload level (id + score are
+ * always returned by the backend regardless). Deliberately small: the chunk body
+ * plus the date, which is what most callers actually read. Field names match the
+ * single-namespace `bill` schema; backends whose collection lacks a field simply
+ * don't return it.
+ */
+export const DECENT_ATTRIBUTES = ["content", "notification_action_time"] as const;
+
 export type QueryOptions = {
   /** Number of nearest neighbors to return (default 10). */
   topK?: number;
@@ -45,11 +57,15 @@ export type QueryOptions = {
   /** Metadata pre-filter applied before/with the vector search. */
   filter?: QueryFilter;
   /**
-   * Return only document ids + score — no metadata, no vectors. Isolates raw
-   * search latency from response-payload cost (e.g. large chunk_text/summary
-   * fields), matching Turbopuffer's "control include_attributes" guidance.
+   * How much per-hit attribute payload to return, to weigh raw search latency
+   * against response-payload cost (large text fields dominate the payload):
+   *   "minimal" — id + score only (no attributes, no vector)
+   *   "decent"  — id + score + a small useful subset (see DECENT_ATTRIBUTES)
+   *   "full"    — all attributes except the vector (default)
+   * Not every backend supports field selection (see each store); they degrade
+   * "decent" to the nearest capability.
    */
-  minimal?: boolean;
+  attributePayload?: AttributePayload;
   /**
    * Optional sink for the backend's server-side query diagnostics, called once
    * per query when the backend reports them (Turbopuffer only today; others

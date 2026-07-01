@@ -17,6 +17,7 @@ import type {
   VectorRow,
   VectorStore,
 } from "../../utils/vector-store";
+import { DECENT_ATTRIBUTES } from "../../utils/vector-store";
 import { createLogger } from "../../logger";
 import { getOpenSearch } from "./client";
 
@@ -128,18 +129,26 @@ export class OpenSearchStore implements VectorStore {
   }
 
   async query(vector: number[], options: QueryOptions = {}): Promise<QueryHit[]> {
-    const { topK = 10, filter, minimal } = options;
+    const { topK = 10, filter, attributePayload = "full" } = options;
     const knn: Record<string, unknown> = {
       [VECTOR_FIELD]: { vector, k: topK, ...(filter ? { filter: toOpenSearchFilter(filter) } : {}) },
     };
+    // Payload level → _source selection:
+    //   minimal — no _source at all (id + score only)
+    //   decent  — only the small DECENT_ATTRIBUTES subset
+    //   full    — all fields except the raw vector
+    const source =
+      attributePayload === "minimal"
+        ? false
+        : attributePayload === "decent"
+          ? { includes: [...DECENT_ATTRIBUTES] }
+          : { excludes: [VECTOR_FIELD] };
     const { body } = await getOpenSearch().search({
       index: this.index,
       body: {
         size: topK,
         query: { knn },
-        // minimal: return no _source at all (id + score only). Otherwise all
-        // fields except the raw vector.
-        _source: minimal ? false : { excludes: [VECTOR_FIELD] },
+        _source: source,
       },
     });
     return (body.hits?.hits ?? []).map((hit: any) => ({

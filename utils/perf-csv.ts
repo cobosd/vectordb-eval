@@ -80,6 +80,22 @@ export function aggregatePerf(samples: QueryPerf[]): PerfDiagnostics {
   };
 }
 
+/**
+ * Console-print the per-service server-side diagnostics (the same three values
+ * that go to CSV): coldest cache temperature, max exhaustive-scan count, and mean
+ * server time. Only services that reported diagnostics appear (Turbopuffer today).
+ * No-op when nothing was reported, so runs against other backends stay quiet.
+ */
+export function printDiagnostics(perfByService: Record<string, QueryPerf[]>): void {
+  const rows: Record<string, PerfDiagnostics> = {};
+  for (const [service, samples] of Object.entries(perfByService)) {
+    if (samples.length) rows[service] = aggregatePerf(samples);
+  }
+  if (Object.keys(rows).length === 0) return;
+  console.log("\nServer-side diagnostics (cache_temp = coldest seen; exhaustive_max = brute-force scans; server_ms_avg excludes network):");
+  console.table(rows);
+}
+
 export function csvEscape(v: unknown): string {
   const s = String(v ?? "");
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;

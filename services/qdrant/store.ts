@@ -23,6 +23,7 @@ import type {
   VectorRow,
   VectorStore,
 } from "../../utils/vector-store";
+import { DECENT_ATTRIBUTES } from "../../utils/vector-store";
 import { createLogger } from "../../logger";
 import { getQdrant } from "./client";
 
@@ -151,13 +152,22 @@ export class QdrantStore implements VectorStore {
   }
 
   async query(vector: number[], options: QueryOptions = {}): Promise<QueryHit[]> {
-    const { topK = 10, filter, minimal } = options;
+    const { topK = 10, filter, attributePayload = "full" } = options;
+    // Payload level → which fields to hydrate. ROW_ID_KEY is always included so the
+    // real row id resolves (with_payload:false would surface Qdrant's internal id).
+    //   minimal — just the id field
+    //   decent  — id + the small DECENT_ATTRIBUTES subset
+    //   full    — all payload
+    const withPayload =
+      attributePayload === "minimal"
+        ? [ROW_ID_KEY]
+        : attributePayload === "decent"
+          ? [ROW_ID_KEY, ...DECENT_ATTRIBUTES]
+          : true;
     const res = await getQdrant().query(this.collection, {
       query: vector,
       limit: topK,
-      // minimal: return only the id field (the real row id lives in payload under
-      // ROW_ID_KEY; with_payload:false would surface Qdrant's internal point id).
-      with_payload: minimal ? [ROW_ID_KEY] : true,
+      with_payload: withPayload,
       with_vector: false, // never ship the raw vector back — inflates payload
       ...(filter ? { filter: toQdrantFilter(filter) } : {}),
     });

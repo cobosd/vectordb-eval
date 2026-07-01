@@ -12,14 +12,16 @@
  *   bun scripts/performance.ts "renewable energy incentives" "background check rules"
  *   bun scripts/performance.ts --query="school funding"   # run one query once per service
  *   bun scripts/performance.ts --warm                     # opt into native cache prewarm
- *   bun scripts/performance.ts --minimal                  # return ids only (no metadata payload)
+ *   bun scripts/performance.ts --attribute-payload=minimal  # ids only (no metadata payload)
+ *   bun scripts/performance.ts --attribute-payload=decent   # ids + content + date only
+ *   bun scripts/performance.ts --attribute-payload=full     # all attributes (default)
  */
 
 import { COLLECTION_KEYS, COLLECTIONS, type CollectionKey } from "../consts";
 import { embedBatch } from "../utils/embedder";
 import { createStore } from "../utils/vector-indexer";
-import type { QueryPerf, ServiceName, VectorStore } from "../utils/vector-store";
-import { aggregatePerf, appendPerfRows, type PerfCsvRow } from "../utils/perf-csv";
+import type { AttributePayload, QueryPerf, ServiceName, VectorStore } from "../utils/vector-store";
+import { aggregatePerf, appendPerfRows, printDiagnostics, type PerfCsvRow } from "../utils/perf-csv";
 import { createLogger } from "../logger";
 
 const logger = createLogger("performance");
@@ -40,7 +42,7 @@ const flag = (name: string, fallback: string): string => {
 
 // Reject unknown flags so typos / unimplemented options fail loudly instead of
 // being silently ignored.
-const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "query", "warm", "minimal", "collections"]);
+const KNOWN_FLAGS = new Set(["topk", "iterations", "services", "consistency", "query", "warm", "attribute-payload", "collections"]);
 const unknown = args
   .filter((a) => a.startsWith("--"))
   .map((a) => a.slice(2).split("=")[0]!)
@@ -66,10 +68,15 @@ const CONSISTENCY = flag("consistency", "strong") as "strong" | "eventual";
 const ONESHOT = flag("query", "");
 // Native cache prewarm (Turbopuffer hintCacheWarm) is off by default; --warm enables it.
 const WARM = args.includes("--warm");
-// --minimal: return only document ids (no metadata) to isolate search latency
-// from response-payload cost. Shared by every query() call below.
-const MINIMAL = args.includes("--minimal");
-const QUERY_OPTS = { topK: TOPK, consistency: CONSISTENCY, minimal: MINIMAL };
+// --attribute-payload=minimal|decent|full (default full): how much per-hit payload
+// to return, to weigh search latency against response-payload cost. Shared by every
+// query() call below. minimal = id+score only; decent = id+score+content+date; full = all attrs.
+const PAYLOAD = flag("attribute-payload", "full") as AttributePayload;
+if (!["minimal", "decent", "full"].includes(PAYLOAD)) {
+  console.error(`Invalid --attribute-payload: "${PAYLOAD}". Expected one of: minimal, decent, full.`);
+  process.exit(1);
+}
+const QUERY_OPTS = { topK: TOPK, consistency: CONSISTENCY, attributePayload: PAYLOAD };
 
 // --collections=bill (or a CSV) restricts the sweep to specific collections.
 // Defaults to the two-namespace set (bill_text, bill_amendment). `bill` targets
@@ -229,7 +236,7 @@ async function main() {
   console.log(
     `\nEmbedded ${queries.length} queries in ${round(embedMs)}ms ` +
       `(${round(embedMs / queries.length)}ms/query, shared across services)` +
-      `${MINIMAL ? " · minimal: id-only" : ""}\n`,
+      `${PAYLOAD !== "full" ? ` · payload: ${PAYLOAD}` : ""}\n`,
   );
 
   // service:collection -> isolated per-call latencies
@@ -306,6 +313,8 @@ async function main() {
     if (endToEndMax[service]) e2eRows[`${service} max(per-collection)`] = stats(endToEndMax[service]!);
   }
   console.table(highlightedStatsTable(e2eRows, winnerKeys(e2eRows, (key) => key.includes("max(per-collection)") ? "max" : "end-to-end")));
+
+  printDiagnostics(perfByService);
 
   // Persist the per-service end-to-end stats to CSV when a caller (run.sh) sets
   // PERF_CSV. The whole sweep accumulates into one evals/csv/<timestamp>.csv,
